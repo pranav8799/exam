@@ -1,0 +1,88 @@
+from enum import Enum
+from datetime import datetime, timezone
+from typing import Optional, List, TYPE_CHECKING
+from sqlmodel import SQLModel, Field, Relationship, Index
+from app.db.models.types import DateTimeTZ, BigIntPK
+
+if TYPE_CHECKING:
+    from app.db.models.hierarchy import Exam
+    from app.db.models.question import Question
+
+
+class SetMatchStatus(str, Enum):
+    MATCHED = "MATCHED"
+    MISMATCH_SKIPPED = "MISMATCH_SKIPPED"
+    MULTI_SET_MATRIX = "MULTI_SET_MATRIX"
+    UNDETECTED = "UNDETECTED"
+
+
+class MappingStatus(str, Enum):
+    APPLIED = "APPLIED"
+    QUESTION_NOT_FOUND = "QUESTION_NOT_FOUND"
+    CONFLICT_FLAGGED = "CONFLICT_FLAGGED"
+    SKIPPED_SET_MISMATCH = "SKIPPED_SET_MISMATCH"
+
+
+class AnswerKeyBatch(SQLModel, table=True):
+    __tablename__ = "answer_key_batches"
+    __table_args__ = (Index("ix_ak_batch_exam_status", "exam_id", "set_match_status"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True, sa_type=BigIntPK)
+    exam_id: int = Field(foreign_key="exams.id", ondelete="CASCADE", index=True)
+    pdf_path: str = Field(description="Path or S3 key of uploaded answer key PDF/image")
+    target_set_code: str = Field(
+        default="SET_A",
+        max_length=20,
+        index=True,
+        description="Expected paper set e.g. SET_A",
+    )
+    detected_set_code: Optional[str] = Field(
+        default=None,
+        max_length=20,
+        index=True,
+        description="Set code detected by LLM from image header",
+    )
+    set_match_status: SetMatchStatus = Field(
+        default=SetMatchStatus.UNDETECTED, index=True
+    )
+    total_keys_extracted: int = Field(default=0)
+    total_keys_mapped: int = Field(default=0)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_type=DateTimeTZ,
+    )
+
+    # Relationships
+    exam: Optional["Exam"] = Relationship(back_populates="answer_key_batches")
+    mappings: List["AnswerKeyMapping"] = Relationship(
+        back_populates="batch", cascade_delete=True
+    )
+
+
+class AnswerKeyMapping(SQLModel, table=True):
+    __tablename__ = "answer_key_mappings"
+    __table_args__ = (
+        Index("ix_ak_mapping_batch_q", "batch_id", "question_id"),
+        Index("ix_ak_mapping_status", "mapping_status"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True, sa_type=BigIntPK)
+    batch_id: int = Field(
+        foreign_key="answer_key_batches.id", ondelete="CASCADE", index=True
+    )
+    question_id: Optional[int] = Field(
+        default=None, foreign_key="questions.id", ondelete="CASCADE", index=True
+    )
+    printed_question_number: int = Field(index=True)
+    detected_option_label: str = Field(max_length=10, description="'A', 'B', 'C', 'D'")
+    paper_set_code: str = Field(default="SET_A", max_length=20, index=True)
+    mapping_status: MappingStatus = Field(default=MappingStatus.APPLIED, index=True)
+    notes: Optional[str] = Field(default=None)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_type=DateTimeTZ,
+    )
+
+    # Relationships
+    batch: Optional[AnswerKeyBatch] = Relationship(back_populates="mappings")
+    question: Optional["Question"] = Relationship(back_populates="answer_key_mappings")

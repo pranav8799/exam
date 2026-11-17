@@ -1,0 +1,308 @@
+import React, { useEffect, useCallback } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+import {
+  LayoutDashboard,
+  Calendar,
+  BookOpen,
+  Brain,
+  BarChart2,
+  Trophy,
+  Medal,
+  Crown,
+  X,
+  Bookmark,
+  Globe,
+  Bell,
+  Swords,
+  NotebookPen,
+} from 'lucide-react';
+import { useBreakpoint } from '../../hooks/useBreakpoint';
+import { prefetchRoute } from '../../utils/routePrefetch';
+
+interface StudentSidebarProps {
+  user?: any;
+  collapsed: boolean;
+  mobileOpen: boolean;
+  onToggleCollapse: () => void;
+  onCloseMobile: () => void;
+}
+
+export function StudentSidebar({
+  user,
+  collapsed,
+  mobileOpen,
+  onCloseMobile,
+}: StudentSidebarProps) {
+  const location = useLocation();
+  const currentPath = location.pathname;
+  const { isTabletOrBelow: isMobile } = useBreakpoint();
+
+  // Close sidebar on Escape key
+  useEffect(() => {
+    if (!mobileOpen) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onCloseMobile();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [mobileOpen, onCloseMobile]);
+
+  // Lock body scroll when mobile sidebar is open
+  useEffect(() => {
+    if (isMobile && mobileOpen) {
+      document.body.classList.add('scroll-lock');
+    } else {
+      document.body.classList.remove('scroll-lock');
+    }
+    return () => {
+      document.body.classList.remove('scroll-lock');
+    };
+  }, [isMobile, mobileOpen]);
+
+  const navItems = [
+    { icon: LayoutDashboard, label: 'Dashboard', to: '/dashboard' },
+    { icon: BookOpen, label: 'PYQs Simulation', to: '/pyq' },
+    { icon: Brain, label: 'Analyse & Practice PYQs', to: '/mocks' },
+    { icon: Calendar, label: 'Study Planner', to: '/study-planner' },
+    { icon: Swords, label: 'Challenges', to: '/challenges' },
+    { icon: BarChart2, label: 'Analytics', to: '/analytics' },
+    { icon: Globe, label: 'Current Affairs', to: '/learn/current-affairs' },
+    { icon: Bell, label: 'Announcements', to: '/notifications' },
+    { icon: Bookmark, label: 'Bookmarks', to: '/bookmarks' },
+    { icon: NotebookPen, label: 'Mistake Notebook', to: '/mistakes' },
+  ];
+
+  const reportItems = [
+    { icon: BarChart2, label: 'Weekly Insights', to: '/reports/weekly' },
+    { icon: Medal, label: 'Leaderboard', to: '/leaderboard' },
+    { icon: Trophy, label: 'Performance Rank', to: '/reports/monthly' },
+  ];
+
+  const isCollapsedDesktop = collapsed && !isMobile;
+
+  const renderNavItem = (item: { icon: any; label: string; to: string }) => {
+    const isActive = currentPath === item.to;
+    const Icon = item.icon;
+
+    return (
+      <Link
+        key={item.to}
+        to={item.to}
+        onClick={onCloseMobile}
+        title={isCollapsedDesktop ? item.label : undefined}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          padding: isCollapsedDesktop ? '10px 0' : '10px 14px',
+          justifyContent: isCollapsedDesktop ? 'center' : 'flex-start',
+          borderRadius: 'var(--radius)',
+          textDecoration: 'none',
+          fontSize: 13.5,
+          fontWeight: isActive ? 600 : 400,
+          color: isActive ? 'var(--bg-card)' : 'rgba(255, 255, 255, 0.65)',
+          backgroundColor: isActive ? 'rgba(var(--primary-red-rgb), 0.15)' : 'transparent',
+          borderLeft:
+            isActive && !isCollapsedDesktop ? '3px solid var(--primary-red)' : '3px solid transparent',
+          transition: 'all 0.15s ease',
+          position: 'relative',
+          minHeight: 44 /* Touch target */,
+        }}
+        onTouchStart={() => prefetchRoute(item.to)}
+        onMouseEnter={(e) => {
+          prefetchRoute(item.to);
+          if (!isActive) {
+            e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.05)';
+            e.currentTarget.style.color = 'var(--bg-card)';
+          }
+        }}
+        onMouseLeave={(e) => {
+          if (!isActive) {
+            e.currentTarget.style.backgroundColor = 'transparent';
+            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.65)';
+          }
+        }}
+      >
+        <Icon
+          size={17}
+          color={isActive ? 'var(--primary-red)' : 'rgba(255, 255, 255, 0.65)'}
+          style={{ flexShrink: 0 }}
+        />
+        {!isCollapsedDesktop && <span>{item.label}</span>}
+      </Link>
+    );
+  };
+
+  // Build sidebar CSS class
+  const sidebarClass = [
+    'app-sidebar',
+    isCollapsedDesktop ? 'collapsed' : '',
+    isMobile && mobileOpen ? 'mobile-open' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  return (
+    <>
+      {/* Mobile Backdrop Overlay */}
+      {isMobile && mobileOpen && (
+        <div className="sidebar-backdrop" onClick={onCloseMobile} aria-hidden="true" />
+      )}
+
+      {/* Sidebar */}
+      <aside
+        className={sidebarClass}
+        role="navigation"
+        aria-label="Main navigation"
+        aria-hidden={isMobile && !mobileOpen ? 'true' : undefined}
+      >
+        {/* Label row — the header hamburger is the only sidebar toggle; mobile keeps a close X */}
+        {(!isCollapsedDesktop || isMobile) && (
+          <div
+            style={{
+              padding: '16px 16px 6px 20px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+            }}
+          >
+            <span
+              style={{
+                fontSize: 11,
+                textTransform: 'uppercase',
+                fontWeight: 700,
+                color: 'rgba(255, 255, 255, 0.4)',
+                letterSpacing: '0.08em',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+              }}
+            >
+              Main Navigation
+            </span>
+
+            {isMobile && (
+              <button
+                onClick={onCloseMobile}
+                className="touch-target"
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: 'rgba(255, 255, 255, 0.6)',
+                  cursor: 'pointer',
+                  padding: 4,
+                }}
+                aria-label="Close navigation"
+              >
+                <X size={18} />
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Primary Nav Links */}
+        <nav
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+            padding: isCollapsedDesktop ? '8px' : '0 12px',
+            flex: 1,
+            overflowY: 'auto',
+          }}
+        >
+          {navItems.map(renderNavItem)}
+
+          <div
+            style={{
+              margin: '16px 0 8px 0',
+              padding: isCollapsedDesktop ? '0' : '0 8px',
+              borderTop: '1px solid rgba(255, 255, 255, 0.08)',
+              paddingTop: 16,
+            }}
+          >
+            {!isCollapsedDesktop && (
+              <span
+                style={{
+                  fontSize: 11,
+                  textTransform: 'uppercase',
+                  fontWeight: 700,
+                  color: 'rgba(255, 255, 255, 0.4)',
+                  letterSpacing: '0.08em',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                  display: 'block',
+                  marginBottom: 8,
+                }}
+              >
+                Performance Reports
+              </span>
+            )}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {reportItems.map(renderNavItem)}
+            </div>
+          </div>
+        </nav>
+
+        {/* Upgrade to PRO Box preserved at bottom — hidden for students already on Premium */}
+        {!isCollapsedDesktop && user?.subscription_tier !== 'PREMIUM' && (
+          <div style={{ padding: 12 }}>
+            <div
+              style={{
+                padding: 14,
+                borderRadius: 'var(--radius)',
+                background: '#111111',
+                border: '1px solid #F2B623',
+                boxShadow: '0 4px 16px rgba(0, 0, 0, 0.25)',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  color: '#F2B623',
+                  fontWeight: 700,
+                  fontSize: 13,
+                  marginBottom: 6,
+                }}
+              >
+                <Crown size={16} /> Upgrade to PRO
+              </div>
+              <p
+                style={{
+                  fontSize: 11,
+                  color: 'rgba(255, 255, 255, 0.7)',
+                  margin: '0 0 10px 0',
+                  lineHeight: 1.4,
+                }}
+              >
+                Unlock AI insights, detailed analytics and unlimited test attempts.
+              </p>
+              <Link
+                to="/billing"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: '6px 12px',
+                  borderRadius: 'var(--radius)',
+                  border: '1px solid #F2B623',
+                  backgroundColor: 'transparent',
+                  color: '#F2B623',
+                  fontSize: 12,
+                  fontWeight: 600,
+                  textDecoration: 'none',
+                  transition: 'all 0.15s ease',
+                  minHeight: 44 /* Touch target */,
+                }}
+              >
+                Explore PRO &rarr;
+              </Link>
+            </div>
+          </div>
+        )}
+      </aside>
+    </>
+  );
+}

@@ -1,0 +1,662 @@
+"""Deterministic regex question parser for EXPLAINED_QA PDF formats.
+
+Two layouts are supported:
+- Tagged papers: "Q1. [Subject: ...] [Microtheme: ...]" headers, "(A)" options, "Answer: (B)".
+- Question banks: "1. <stem> [MPSC Mains 2017]", "A." options, "Answer B", "Solution.", arrow
+  statement lines ("➤ (a) ..."), and chapter headings ("— Economic Planning —") between questions.
+  They carry no syllabus tags; the Knowledge Layer AI fills those in after upload.
+
+Parses OCR-generated full markdown into structured QuestionRecord objects:
+- Q_HEADER: [Subject: ...] [Topic: ...] [Sub-topic: ...] [Difficulty: ...]
+- Stem (including numbered statements)
+- Options (A)-(D)
+- Answer line
+- Solution text and bullets
+- Common Mistake
+- Reverse Logic Box per-option reasoning
+- Cross-page stitching without repeated headers
+- Picture and table disambiguation by vertical coordinates
+"""
+from typing import List, Dict, Optional, Any, Tuple
+import re
+from pydantic import BaseModel, Field
+
+from app.db.models.enums import DifficultyLevel
+from app.pipeline.patterns import (
+    PAGE_BREAK_PATTERN,
+    Q_HEADER_PATTERN,
+    NUMBERED_Q_HEADER_PATTERN,
+    SECTION_HEADING_PATTERN,
+    SOURCE_TAG_PATTERN,
+    ARROW_LINE_PATTERN,
+    ANSWER_OPTIONS_LABEL_PATTERN,
+    OPTION_LINE_PATTERN,
+    ANSWER_LINE_PATTERN,
+    SOLUTION_HEADER_PATTERN,
+    SOLUTION_BULLET_PATTERN,
+    SOLUTION_NOTE_PATTERN,
+    STEM_CLOSING_PROMPT_PATTERN,
+    STEM_LIST_ITEM_PATTERN,
+    COMMON_MISTAKE_HEADER_PATTERN,
+    REVERSE_LOGIC_HEADER_PATTERN,
+    REVERSE_LOGIC_OPTION_PATTERN,
+    REVERSE_LOGIC_SHORT_OPTION_PATTERN,
+    REVERSE_LOGIC_TRAP_PATTERN,
+    PICTURE_MARKER_PATTERN,
+    TABLE_MARKER_PATTERN,
+    TABLE_ROW_PATTERN,
+    VISUAL_REFERENCE_PATTERN,
+    STATEMENT_LINE_PATTERN,
+    SUBJECT_TAG_PATTERN,
+    TOPIC_TAG_PATTERN,
+    SUBTOPIC_TAG_PATTERN,
+    DIFFICULTY_TAG_PATTERN,
+    TYPE_TAG_PATTERN,
+    RELATED_REFS_HEADER_PATTERN,
+    extract_header_tags,
+)
+from app.pipeline.knowledge_tags import extract_knowledge_tags
+from app.config.logger import setup_logger
+
+logger = setup_logger("RegexQuestionParser")
+
+
+class QuestionRecord(BaseModel):
+    question_number: int
+    subject_raw: Optional[str] = None
+    topic_raw: Optional[str] = None
+    subtopic_raw: Optional[str] = None
+    difficulty_raw: Optional[str] = None
+    type_raw: Optional[str] = None
+    difficulty: DifficultyLevel = Field(default=DifficultyLevel.MEDIUM)
+
+    stem: str
+    statement_lines: List[str] = Field(default_factory=list)
+    options: Dict[str, str] = Field(default_factory=dict)
+    answer_label: str = Field(default="")
+    answer_text: Optional[str] = None
+
+    solution_text: str = Field(default="")
+    solution_bullets: List[str] = Field(default_factory=list)
+    common_mistake: Optional[str] = None
+    reverse_logic: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+
+    # Knowledge Layer: authored [Concepts]/[Entities]/[Relationships] tags and the solution's
+    # "Related Articles / Acts / Cases" list (kept in the solution text as well)
+    concepts_raw: List[str] = Field(default_factory=list)
+    entities_raw: List[str] = Field(default_factory=list)
+    relationships_raw: List[Dict[str, str]] = Field(default_factory=list)
+    related_refs: List[str] = Field(default_factory=list)
+    knowledge_issues: List[str] = Field(default_factory=list)
+
+    # Question-bank layout: chapter heading the question was listed under, and its source
+    # ("MPSC Mains 2017" -> source_year 2017). Both are hints for the Knowledge Layer AI.
+    section_raw: Optional[str] = None
+    source_raw: Optional[str] = None
+    source_year: Optional[int] = None
+
+    page_numbers: List[int] = Field(default_factory=list)
+    pictures: List[Dict[str, Any]] = Field(default_factory=list)
+    tables: List[Dict[str, Any]] = Field(default_factory=list)
+
+    extraction_confidence: float = Field(default=1.0)
+    extraction_issues: List[str] = Field(default_factory=list)
+
+
+def map_difficulty(diff_str: Optional[str]) -> DifficultyLevel:
+    """Maps raw difficulty string to DifficultyLevel enum."""
+    if not diff_str:
+        return DifficultyLevel.MEDIUM
+    d = diff_str.strip().lower()
+    if any(w in d for w in ("easy", "simple", "basic")):
+        return DifficultyLevel.EASY
+    if any(w in d for w in ("tough", "hard", "difficult", "advanced")):
+        return DifficultyLevel.HARD
+    return DifficultyLevel.MEDIUM
+
+
+def detect_format(full_markdown: str) -> str:
+    """Heuristic format detector: checks for repeated Answer and Solution lines."""
+    ans_matches = len(ANSWER_LINE_PATTERN.findall(full_markdown))
+    sol_matches = len(SOLUTION_HEADER_PATTERN.findall(full_markdown))
+
+    if ans_matches >= 1 and sol_matches >= 1:
+        return "EXPLAINED_QA"
+    return "RAW_EXAM"
+
+
+def _numbered_question_starts(markdown: str) -> List[Tuple[int, int, str]]:
+    """(position, number, rest of line) for "N. stem" lines forming the longest N, N+1, ... run.
+
+    Numbered lines also occur inside questions ("2011." wrapped from a solution, "1. statement"),
+    so only a consecutive run of numbers is trusted as question starts.
+    """
+    candidates = [(m.start(), int(m.group(1)), m.group(2)) for m in NUMBERED_Q_HEADER_PATTERN.finditer(markdown)]
+    best: List[Tuple[int, int, str]] = []
+    for i, first in enumerate(candidates):
+        run = [first]
+        for cand in candidates[i + 1:]:
+            if cand[1] == run[-1][1] + 1:
+                run.append(cand)
+        if len(run) > len(best):
+            best = run
+    return best if len(best) >= 2 else []
+
+
+def split_into_question_blocks(full_markdown: str) -> List[Dict[str, Any]]:
+    """Splits full document markdown into question blocks on Q_HEADER matches.
+
+    Falls back to the numbered question-bank layout ("1. stem ...") when there are no Q<N>
+    headers. Chapter headings ("— Economic Planning —") are removed from the blocks and each
+    block records the last heading before it as `section`.
+
+    Extracts page provenance from <!-- PAGE_BREAK p={n} --> sentinels
+    while cleaning them out of the block text.
+    """
+    # Pre-normalize question headers:
+    # 1. If Q<N> appears on the same line after punctuation, ensure it starts on a newline
+    norm_md = re.sub(r'([^\n])\s+(Q\s*\d+\s*[\.:\-])', r'\1\n\2', full_markdown)
+    # 2. If 'Q' is split across a newline before digits, join them onto a newline
+    norm_md = re.sub(r'(?i)\bQ\s*[\.:\-]?\s*\n\s*(\d+)', r'\nQ\1', norm_md)
+
+    q_matches = list(Q_HEADER_PATTERN.finditer(norm_md))
+    numbered = not q_matches
+    if numbered:
+        full_markdown = full_markdown.replace("\r\n", "\n")
+        starts = _numbered_question_starts(full_markdown)
+    else:
+        full_markdown = norm_md
+        starts = [(m.start(), int(m.group(1)), m.group(2)) for m in q_matches]
+    if not starts:
+        return []
+
+    headings = [(m.start(), m.group(1).strip()) for m in SECTION_HEADING_PATTERN.finditer(full_markdown)]
+
+    blocks = []
+    num_matches = len(starts)
+
+    # Initial page before any page breaks
+    initial_page = 1
+    first_break = PAGE_BREAK_PATTERN.search(full_markdown[: starts[0][0]])
+    if first_break:
+        initial_page = int(first_break.group(1))
+
+    current_page = initial_page
+
+    for i in range(num_matches):
+        start_pos, q_num, header_remainder = starts[i]
+        end_pos = starts[i + 1][0] if i + 1 < num_matches else len(full_markdown)
+
+        raw_block = full_markdown[start_pos:end_pos]
+
+        # Track page numbers that appear in or before this block
+        block_pages = []
+        # Check if there was a page break before this block
+        pre_breaks = list(PAGE_BREAK_PATTERN.finditer(full_markdown[:start_pos]))
+        if pre_breaks:
+            current_page = int(pre_breaks[-1].group(1))
+        block_pages.append(current_page)
+
+        # Find all page breaks inside this block
+        inner_breaks = list(PAGE_BREAK_PATTERN.finditer(raw_block))
+        for ib in inner_breaks:
+            p_num = int(ib.group(1))
+            if p_num not in block_pages:
+                block_pages.append(p_num)
+            current_page = p_num
+
+        # Clean PAGE_BREAK markers, asset markers and chapter headings from block text; the asset
+        # markers say exactly which pictures/tables sit inside this question
+        picture_ids = [int(m.group(1)) for m in PICTURE_MARKER_PATTERN.finditer(raw_block)]
+        table_ids = [int(m.group(1)) for m in TABLE_MARKER_PATTERN.finditer(raw_block)]
+        # A page break is not a paragraph break: text wrapped across it must still join up
+        clean_block = re.sub(rf"\s*{PAGE_BREAK_PATTERN.pattern}\s*", "\n", raw_block, flags=re.IGNORECASE)
+        clean_block = PICTURE_MARKER_PATTERN.sub("", clean_block)
+        clean_block = TABLE_MARKER_PATTERN.sub("", clean_block)
+        clean_block = SECTION_HEADING_PATTERN.sub("", clean_block).strip()
+        if numbered:
+            # Give the block the same shape as a Q<N> block: a header line, then the stem
+            clean_block = re.sub(r"^\s*\d{1,4}\.[ \t]+", f"Q{q_num}.\n", clean_block, count=1)
+        section = next((name for pos, name in reversed(headings) if pos < start_pos), None)
+
+        # Find first line of the block as the header line
+        header_line = clean_block.split("\n")[0] if clean_block else ""
+
+        blocks.append(
+            {
+                "question_number": q_num,
+                "header_line": header_line,
+                "header_remainder": header_remainder,
+                "raw_text": raw_block,
+                "clean_text": clean_block,
+                "page_numbers": sorted(list(set(block_pages))),
+                "start_page": block_pages[0] if block_pages else current_page,
+                "section": section,
+                "picture_ids": picture_ids,
+                "table_ids": table_ids,
+            }
+        )
+
+    return blocks
+
+
+def disambiguate_asset_question(
+    asset_bbox: Optional[List[float]],
+    asset_page: int,
+    current_q_pages: List[int],
+    next_q_start_page: Optional[int],
+    next_q_header_y: Optional[float] = None,
+) -> bool:
+    """Explicit vertical tie-breaking for pictures/tables on pages shared between two questions.
+
+    Returns True if the asset belongs to the current question, False if it belongs to the next.
+    """
+    # If the asset is on a page that the current question spans, but not the next question's start page:
+    if next_q_start_page is None or asset_page < next_q_start_page:
+        return asset_page in current_q_pages
+
+    # If the asset is on a page where the next question begins:
+    if asset_page == next_q_start_page:
+        if asset_bbox is not None and next_q_header_y is not None:
+            # Check bbox vertical coordinate (top or ymin).
+            # If docling bbox is [l, t, r, b] or [ymin, xmin, ymax, xmax]:
+            asset_top = asset_bbox[1] if len(asset_bbox) > 1 else 0
+            # If asset is above the next question's header, it belongs to the current question
+            return asset_top < next_q_header_y
+        # Default tie-break: if page is shared, question continuation gets assets in top half
+        return False
+
+    return False
+
+
+def _join_stem_lines(stem_lines: List[str]) -> str:
+    """Stem lines joined by newlines, with blank lines around markdown tables so they render as tables,
+    and before the prompt closing a numbered list (else markdown folds it into the last list item)."""
+    parts: List[str] = []
+    prev_is_row = False
+    in_list = False  # since a numbered item, wrapped item lines included
+    for sl in stem_lines:
+        is_row = bool(TABLE_ROW_PATTERN.match(sl))
+        closes_list = in_list and bool(STEM_CLOSING_PROMPT_PATTERN.match(sl))
+        if parts and (is_row != prev_is_row or closes_list):
+            parts.append("")
+        parts.append(sl)
+        prev_is_row = is_row
+        in_list = bool(STEM_LIST_ITEM_PATTERN.match(sl)) or (in_list and not closes_list and not is_row)
+    return "\n".join(parts).strip()
+
+
+def _parse_short_reverse_logic(box_lines: List[str]) -> Dict[str, Dict[str, str]]:
+    """Reverse Logic entries written as "(A) 3 2 4 1 — <why it is wrong>. Trap: <why it tempts>"."""
+    box_text = "\n".join(l.strip() for l in box_lines if l.strip())
+    result: Dict[str, Dict[str, str]] = {}
+    for m in REVERSE_LOGIC_SHORT_OPTION_PATTERN.finditer(box_text):
+        reasoning = re.sub(r"\s+", " ", m.group(3)).strip()
+        if not reasoning:
+            continue
+        parts = REVERSE_LOGIC_TRAP_PATTERN.split(reasoning, maxsplit=1)
+        result[m.group(1).upper()] = {
+            "why_tempting": parts[1].strip() if len(parts) > 1 else "",
+            "whats_actually_true": parts[0].strip(),
+        }
+    return result
+
+
+def parse_question_block(
+    block: Dict[str, Any],
+    pictures: Optional[List[Dict[str, Any]]] = None,
+    tables: Optional[List[Dict[str, Any]]] = None,
+    next_q_start_page: Optional[int] = None,
+    next_q_header_y: Optional[float] = None,
+) -> QuestionRecord:
+    """Parses a single cleaned question block into a structured QuestionRecord."""
+    clean_text = block.get("clean_text") or block.get("raw_text", "")
+    q_num = block["question_number"]
+    header_line = block["header_line"]
+    page_numbers = block["page_numbers"]
+
+    issues: List[str] = []
+    confidence = 1.0
+
+    # 0. Pull out authored Knowledge Layer tags so they never leak into the stem or solution
+    # (tag problems stay with the knowledge data; they must not affect extraction confidence or review flags)
+    clean_text, knowledge = extract_knowledge_tags(clean_text)
+
+    # 2. Split Block into Sections:
+    # Stem + Options | Answer | Solution | Common Mistake | Reverse Logic Box
+    lines = clean_text.split("\n")
+
+    # Find boundaries
+    first_opt_idx = None
+    ans_idx = None
+    sol_idx = None
+    mistake_idx = None
+    reverse_idx = None
+
+    for idx, line in enumerate(lines):
+        line_str = line.strip()
+        if idx == 0:
+            continue
+
+        if first_opt_idx is None and OPTION_LINE_PATTERN.match(line_str):
+            first_opt_idx = idx
+
+        if ans_idx is None and ANSWER_LINE_PATTERN.match(line_str):
+            ans_idx = idx
+
+        if sol_idx is None and SOLUTION_HEADER_PATTERN.match(line_str):
+            sol_idx = idx
+
+        if mistake_idx is None and COMMON_MISTAKE_HEADER_PATTERN.match(line_str):
+            mistake_idx = idx
+
+        if reverse_idx is None and REVERSE_LOGIC_HEADER_PATTERN.match(line_str):
+            reverse_idx = idx
+
+    # Options are the last "A" option line before the answer: a stem may itself list labelled
+    # statements such as "(A) PMEGP was started in 2008. (B) ..." ahead of the real options.
+    options_limit = ans_idx if ans_idx is not None else (sol_idx if sol_idx is not None else len(lines))
+    last_a = [
+        idx for idx in range(1, options_limit)
+        if (om := OPTION_LINE_PATTERN.match(lines[idx].strip())) and om.group(1).upper() == "A"
+    ]
+    if last_a:
+        first_opt_idx = last_a[-1]
+
+    # 1. Extract Tags from Header Line and any subsequent tag lines before stem
+    stem_end = first_opt_idx if first_opt_idx is not None else (ans_idx if ans_idx is not None else len(lines))
+    header_block = [header_line]
+    clean_stem_lines = []
+    arrow_line_idx = set()  # indexes into clean_stem_lines of "➤" statement lines
+
+    for l in lines[1:stem_end]:
+        l_str = l.strip()
+        if not l_str:
+            continue
+        # "➤ (a) Rural Works Programme" -> "(a) Rural Works Programme"; drop bare "➤ Answer Options:" labels
+        arrow = ARROW_LINE_PATTERN.match(l_str)
+        if arrow:
+            l_str = arrow.group(1).strip()
+            if not l_str or ANSWER_OPTIONS_LABEL_PATTERN.match(l_str):
+                continue
+            arrow_line_idx.add(len(clean_stem_lines))
+        # Check if line contains metadata tags (a table cell is always stem content)
+        has_tag = not TABLE_ROW_PATTERN.match(l_str) and any(
+            p.search(l_str)
+            for p in (SUBJECT_TAG_PATTERN, TOPIC_TAG_PATTERN, SUBTOPIC_TAG_PATTERN, DIFFICULTY_TAG_PATTERN, TYPE_TAG_PATTERN)
+        )
+        # A header wrapped inside a tag ("[Difficulty:" / "Moderate]") continues on this line
+        header_so_far = " ".join(header_block)
+        continues_open_tag = not clean_stem_lines and header_so_far.count("[") > header_so_far.count("]")
+        if has_tag or continues_open_tag:
+            header_block.append(l_str)
+        else:
+            clean_stem_lines.append(l_str)
+
+    full_header_text = " ".join(header_block)
+    tags = extract_header_tags(full_header_text)
+    subject_raw = tags["subject_raw"]
+    topic_raw = tags["topic_raw"]
+    subtopic_raw = tags["subtopic_raw"]
+    difficulty_raw = tags["difficulty_raw"]
+    type_raw = tags.get("type_raw")
+    if not type_raw:
+        type_match = TYPE_TAG_PATTERN.search(clean_text)
+        if type_match:
+            type_raw = type_match.group(1).strip()
+    difficulty = map_difficulty(difficulty_raw)
+
+    # 3. Stem Extraction
+    if arrow_line_idx:
+        # Question-bank stems: each "➤" statement is its own paragraph (single newlines collapse in
+        # markdown); other lines are the PDF's word wrap and are joined back into their paragraph.
+        paragraphs: List[str] = []
+        for idx, sl in enumerate(clean_stem_lines):
+            is_row = bool(TABLE_ROW_PATTERN.match(sl))
+            prev_is_row = idx > 0 and bool(TABLE_ROW_PATTERN.match(clean_stem_lines[idx - 1]))
+            if is_row and prev_is_row:
+                paragraphs[-1] = f"{paragraphs[-1]}\n{sl}"
+            elif idx in arrow_line_idx or not paragraphs or is_row or prev_is_row:
+                paragraphs.append(sl)
+            else:
+                paragraphs[-1] = f"{paragraphs[-1]} {sl}"
+        stem = "\n\n".join(paragraphs).strip()
+    else:
+        stem = _join_stem_lines(clean_stem_lines)
+
+    # Question-bank source tag ("[MPSC Mains 2017]", possibly wrapped): keep it out of the stem
+    source_raw, source_year = None, None
+    source_matches = list(SOURCE_TAG_PATTERN.finditer(stem))
+    if source_matches:
+        src = source_matches[-1]
+        source_raw = re.sub(r"\s+", " ", src.group(1)).strip()
+        source_year = int(src.group(2))
+        stem = (stem[: src.start()].rstrip() + stem[src.end():]).strip()
+
+    statement_lines = []
+    for sl in clean_stem_lines:
+        sm = STATEMENT_LINE_PATTERN.match(sl.strip())
+        if sm:
+            statement_lines.append(sm.group(1).strip())
+
+    if not stem:
+        issues.append("EMPTY_STEM")
+        confidence -= 0.35
+
+    # 4. Options Extraction (A)-(D)
+    options: Dict[str, str] = {}
+    if first_opt_idx is not None:
+        valid_opts_ends = [idx for idx in (ans_idx, sol_idx, mistake_idx, reverse_idx) if idx is not None and idx > first_opt_idx]
+        opts_end = min(valid_opts_ends) if valid_opts_ends else len(lines)
+        current_opt_label = None
+        current_opt_text: List[str] = []
+
+        for line in lines[first_opt_idx:opts_end]:
+            om = OPTION_LINE_PATTERN.match(line.strip())
+            if om:
+                if current_opt_label:
+                    options[current_opt_label] = " ".join(current_opt_text).strip()
+                current_opt_label = om.group(1).upper()
+                current_opt_text = [om.group(2).strip()]
+            elif current_opt_label and line.strip():
+                current_opt_text.append(line.strip())
+
+        if current_opt_label:
+            options[current_opt_label] = " ".join(current_opt_text).strip()
+
+    # Validate options presence
+    for req_opt in ("A", "B", "C", "D"):
+        if req_opt not in options or not options[req_opt]:
+            issues.append(f"MISSING_OPTION_{req_opt}")
+            confidence -= 0.20
+
+    # 5. Answer Extraction
+    answer_label = ""
+    answer_text = None
+    if ans_idx is not None and ans_idx < len(lines):
+        ans_match = ANSWER_LINE_PATTERN.match(lines[ans_idx].strip())
+        if ans_match:
+            answer_label = ans_match.group(1).upper()
+            answer_text = ans_match.group(2).strip() or None
+    else:
+        # Fallback search for Answer in text
+        for line in lines:
+            ans_match = ANSWER_LINE_PATTERN.match(line.strip())
+            if ans_match:
+                answer_label = ans_match.group(1).upper()
+                answer_text = ans_match.group(2).strip() or None
+                break
+
+    if not answer_label:
+        issues.append("NO_ANSWER_LINE")
+        confidence -= 0.40
+    elif answer_label not in ("A", "B", "C", "D") or answer_label not in options:
+        issues.append("ANSWER_LABEL_NOT_IN_OPTIONS")
+        confidence -= 0.25
+
+    # 6. Solution Extraction (text and bullets)
+    solution_text = ""
+    solution_bullets: List[str] = []
+    related_refs: List[str] = []
+    if sol_idx is not None:
+        valid_sol_ends = [idx for idx in (mistake_idx, reverse_idx) if idx is not None and idx > sol_idx]
+        sol_end = min(valid_sol_ends) if valid_sol_ends else len(lines)
+        sol_raw_lines = lines[sol_idx:sol_end]
+        if sol_raw_lines:
+            first_line = sol_raw_lines[0].strip()
+            sh_match = SOLUTION_HEADER_PATTERN.match(first_line)
+
+            # (text, follows_blank_line); blank lines matter for telling wrapped bullets from new paragraphs
+            body_lines: List[Tuple[str, bool]] = []
+            if sh_match and sh_match.group(1).strip():
+                body_lines.append((sh_match.group(1).strip(), True))
+            after_blank = True
+            for l in sol_raw_lines[1:]:
+                if l.strip():
+                    body_lines.append((l.strip(), after_blank))
+                    after_blank = False
+                else:
+                    after_blank = True
+
+            in_related_refs = False
+            in_bullet = False
+            for bl, follows_blank in body_lines:
+                if RELATED_REFS_HEADER_PATTERN.match(bl):
+                    in_related_refs = True
+                elif in_related_refs:
+                    ref = re.sub(r"^[-–—•■*]+\s*", "", bl).strip()
+                    if ref:
+                        related_refs.append(ref)
+                bm = SOLUTION_BULLET_PATTERN.match(bl)
+                if bm:
+                    solution_bullets.append(bm.group(2).strip())
+                    in_bullet = True
+                elif in_bullet and not follows_blank and not in_related_refs and not SOLUTION_NOTE_PATTERN.match(bl):
+                    # A bullet wrapped onto the next line ("• SGSY was formed by ... TRYSEM, DWCRA,\nand the ...")
+                    solution_bullets[-1] = f"{solution_bullets[-1]} {bl}"
+                else:
+                    solution_bullets.append(bl)
+                    # A note's wrapped lines join it like a bullet's
+                    in_bullet = bool(SOLUTION_NOTE_PATTERN.match(bl))
+
+            solution_text = "\n\n".join(solution_bullets).strip()
+
+    if not solution_text:
+        issues.append("EMPTY_SOLUTION")
+        confidence -= 0.20
+
+    # 7. Common Mistake Extraction
+    common_mistake = None
+    if mistake_idx is not None:
+        valid_mistake_ends = [idx for idx in (reverse_idx,) if idx is not None and idx > mistake_idx]
+        mistake_end = min(valid_mistake_ends) if valid_mistake_ends else len(lines)
+        if mistake_idx < len(lines):
+            first_m_line = lines[mistake_idx].strip()
+            mm = COMMON_MISTAKE_HEADER_PATTERN.match(first_m_line)
+            mistake_parts = [mm.group(1).strip()] if mm and mm.group(1).strip() else []
+            for l in lines[mistake_idx + 1 : mistake_end]:
+                if l.strip():
+                    mistake_parts.append(l.strip())
+            if mistake_parts:
+                common_mistake = " ".join(mistake_parts).strip()
+
+    # 8. Reverse Logic Box Extraction
+    reverse_logic: Dict[str, Dict[str, str]] = {}
+    if reverse_idx is not None and reverse_idx < len(lines):
+        rev_text = "\n".join(lines[reverse_idx:])
+        for rm in REVERSE_LOGIC_OPTION_PATTERN.finditer(rev_text):
+            opt_letter = rm.group(1).upper()
+            why_tempting = rm.group(2).strip()
+            whats_true = rm.group(3).strip()
+
+            # Clean trailing punctuation and markdown
+            why_tempting = re.sub(r"^[-–—:]\s*", "", why_tempting).strip()
+            whats_true = re.sub(r"^[-–—:]\s*", "", whats_true).strip()
+            # Rejoin sentences the PDF wrapped across lines
+            why_tempting = re.sub(r"\s*\n\s*", " ", why_tempting)
+            whats_true = re.sub(r"\s*\n\s*", " ", whats_true)
+
+            reverse_logic[opt_letter] = {
+                "why_tempting": why_tempting,
+                "whats_actually_true": whats_true,
+            }
+        if not reverse_logic:
+            reverse_logic = _parse_short_reverse_logic(lines[reverse_idx + 1:])
+
+    # 9. Matched Pictures and Tables. Assets carrying an "id" were placed in the text as markers,
+    # so the block says exactly which are its own; older extractions fall back to page matching.
+    matched_pictures = []
+    if pictures and any("id" in pic for pic in pictures):
+        own = set(block.get("picture_ids") or [])
+        matched_pictures = [pic for pic in pictures if pic.get("id") in own]
+    elif pictures:
+        for pic in pictures:
+            pic_page = pic.get("page_no", 1)
+            pic_bbox = pic.get("bbox")
+            if pic_page in page_numbers:
+                if disambiguate_asset_question(
+                    pic_bbox,
+                    pic_page,
+                    page_numbers,
+                    next_q_start_page,
+                    next_q_header_y,
+                ):
+                    matched_pictures.append(pic)
+
+    matched_tables = []
+    if tables and any("id" in tbl for tbl in tables):
+        own = set(block.get("table_ids") or [])
+        matched_tables = [tbl for tbl in tables if tbl.get("id") in own]
+    elif tables:
+        for tbl in tables:
+            tbl_page = tbl.get("page_no", 1)
+            tbl_bbox = tbl.get("bbox")
+            if tbl_page in page_numbers:
+                if disambiguate_asset_question(
+                    tbl_bbox,
+                    tbl_page,
+                    page_numbers,
+                    next_q_start_page,
+                    next_q_header_y,
+                ):
+                    matched_tables.append(tbl)
+
+    # A stem that points at a figure/table which was not extracted cannot be answered as shown
+    has_inline_table = any(TABLE_ROW_PATTERN.match(l) for l in stem.split("\n"))
+    if VISUAL_REFERENCE_PATTERN.search(stem) and not matched_pictures and not matched_tables and not has_inline_table:
+        issues.append("MISSING_VISUAL_ASSET")
+        confidence -= 0.25
+
+    confidence = round(max(0.0, min(1.0, confidence)), 3)
+
+    return QuestionRecord(
+        question_number=q_num,
+        subject_raw=subject_raw,
+        topic_raw=topic_raw,
+        subtopic_raw=subtopic_raw,
+        difficulty_raw=difficulty_raw,
+        type_raw=type_raw,
+        difficulty=difficulty,
+        stem=stem,
+        statement_lines=statement_lines,
+        options=options,
+        answer_label=answer_label,
+        answer_text=answer_text,
+        solution_text=solution_text,
+        solution_bullets=solution_bullets,
+        common_mistake=common_mistake,
+        reverse_logic=reverse_logic,
+        page_numbers=page_numbers,
+        pictures=matched_pictures,
+        tables=matched_tables,
+        extraction_confidence=confidence,
+        extraction_issues=issues,
+        concepts_raw=knowledge["concepts"],
+        entities_raw=knowledge["entities"],
+        relationships_raw=knowledge["relationships"],
+        related_refs=related_refs,
+        knowledge_issues=knowledge["issues"],
+        section_raw=block.get("section"),
+        source_raw=source_raw,
+        source_year=source_year,
+    )

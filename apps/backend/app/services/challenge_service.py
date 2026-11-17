@@ -1,0 +1,736 @@
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict
+
+from fastapi import HTTPException
+from sqlalchemy import func, case, or_
+from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from app.db.models.user import User
+from app.db.models.question import Question, QuestionTranslation, QuestionOption, OptionTranslation
+from app.db.models.hierarchy import Subject, Topic, Subtopic, Exam
+from app.db.models.exam_type import ExamType
+from app.db.models.enums import QuestionStatus, LanguageCode
+from app.db.models.challenge import (
+    Challenge,
+    ChallengeQuestion,
+    ChallengeInvite,
+    ChallengeInviteStatus,
+    ChallengeAttempt,
+    ChallengeAttemptStatus,
+    ChallengeResponse,
+    ChallengeVisibility,
+)
+from app.schemas.challenge import (
+    CreateChallengeRequest,
+    ChallengeSummary,
+    ChallengePublicPreview,
+    ChallengeQuestionOut,
+    ChallengeQuestionOption,
+    StartChallengeAttemptResponse,
+    SubmitChallengeAttemptResponse,
+    LeaderboardEntry,
+    ChallengeDuration,
+    ChallengeOptions,
+    ChallengeExamOption,
+    ChallengeInvitee,
+)
+from app.db.models.notification import UserNotification
+
+CHALLENGE_INVITE_NOTIFICATION = "CHALLENGE_INVITE"
+
+DURATION_DELTAS: Dict[ChallengeDuration, Optional[timedelta]] = {
+    ChallengeDuration.ONE_DAY: timedelta(days=1),
+    ChallengeDuration.THREE_DAYS: timedelta(days=3),
+    ChallengeDuration.ONE_WEEK: timedelta(weeks=1),
+    ChallengeDuration.TWO_WEEKS: timedelta(weeks=2),
+    ChallengeDuration.ONE_MONTH: timedelta(days=30),
+    ChallengeDuration.NO_LIMIT: None,
+}
+
+
+def _is_expired(expires_at: Optional[datetime]) -> bool:
+    if not expires_at:
+        return False
+    if expires_at.tzinfo is None:  # SQLite returns naive datetimes; they are stored as UTC
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at < datetime.now(timezone.utc)
+
+
+class ChallengeService:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def _sample_questions(
+        self,
+        subject_names: Optional[List[str]],
+        difficulty,
+        question_count: int,
+        exam_types: Optional[List[ExamType]] = None,
+        years: Optional[List[int]] = None,
+        legacy_subject: Optional[str] = None,
+    ) -> List[Question]:
+        query = select(Question).where(Question.status == QuestionStatus.PUBLISHED)
+        if subject_names or legacy_subject:
+            query = (
+                query.join(Subtopic, Subtopic.id == Question.subtopic_id)
+                .join(Topic, Topic.id == Subtopic.topic_id)
+                .join(Subject, Subject.id == Topic.subject_id)
+            )
+            if subject_names:
+                # Names come from the subject list, so match them exactly (case-insensitive):
+                # "Polity" must not also pull in "Indian Polity & Governance".
+                query = query.where(func.lower(Subject.name).in_([n.strip().lower() for n in subject_names]))
+            else:
+                query = query.where(Subject.name.ilike(f"%{legacy_subject.strip()}%"))
+        if exam_types or years:
+            query = query.join(Exam, Exam.id == Question.exam_id)
+        if exam_types:
+            # A question from any of the chosen exams
+            query = query.where(
+                or_(*[
+                    or_(Exam.exam_type_id == et.id, func.lower(Exam.name).contains(et.name.lower()))
+                    for et in exam_types
+                ])
+            )
+        if years:
+            query = query.where(func.coalesce(Question.source_year, Exam.source_year).in_(years))
+        if difficulty:
+            query = query.where(Question.difficulty == difficulty)
+        query = query.order_by(func.random()).limit(question_count)
+        res = await self.session.exec(query)
+        return list(res.all())
+
+    async def get_options(self) -> ChallengeOptions:
+        """Exams and years that actually have published questions, so the create form
+        only offers combinations that can produce a challenge."""
+        year_expr = func.coalesce(Question.source_year, Exam.source_year)
+        rows = (
+            await self.session.exec(
+                select(ExamType.id, ExamType.name, year_expr)
+                .select_from(Question)
+                .join(Exam, Exam.id == Question.exam_id)
+                .join(ExamType, ExamType.id == Exam.exam_type_id)
+                .where(Question.status == QuestionStatus.PUBLISHED, ExamType.is_active == True)  # noqa: E712
+                .group_by(ExamType.id, ExamType.name, year_expr)
+            )
+        ).all()
+        exams: Dict[int, ChallengeExamOption] = {}
+        all_years = set()
+        for type_id, name, year in rows:
+            opt = exams.setdefault(type_id, ChallengeExamOption(id=type_id, name=name, years=[]))
+            if year:
+                opt.years.append(int(year))
+                all_years.add(int(year))
+        for opt in exams.values():
+            opt.years.sort(reverse=True)
+
+        # Which subjects have published questions, per exam and year. Only questions that are
+        # filed under a subtopic belong to a subject, so exams without a syllabus simply have none.
+        subject_rows = (
+            await self.session.exec(
+                select(ExamType.id, Subject.name, year_expr)
+                .select_from(Question)
+                .join(Exam, Exam.id == Question.exam_id)
+                .join(ExamType, ExamType.id == Exam.exam_type_id)
+                .join(Subtopic, Subtopic.id == Question.subtopic_id)
+                .join(Topic, Topic.id == Subtopic.topic_id)
+                .join(Subject, Subject.id == Topic.subject_id)
+                .where(Question.status == QuestionStatus.PUBLISHED, ExamType.is_active == True)  # noqa: E712
+                .group_by(ExamType.id, Subject.name, year_expr)
+            )
+        ).all()
+        overall: Dict[str, set] = {}
+        for type_id, subject, year in subject_rows:
+            if type_id not in exams or not subject or not year:
+                continue
+            exams[type_id].subject_years.setdefault(subject, []).append(int(year))
+            overall.setdefault(subject, set()).add(int(year))
+        for opt in exams.values():
+            opt.subject_years = {k: sorted(set(v), reverse=True) for k, v in sorted(opt.subject_years.items())}
+        return ChallengeOptions(
+            exams=sorted(exams.values(), key=lambda e: e.name),
+            years=sorted(all_years, reverse=True),
+            subject_years={k: sorted(v, reverse=True) for k, v in sorted(overall.items())},
+        )
+
+    def _to_summary(
+        self,
+        c: Challenge,
+        creator: Optional[User],
+        attempt_count: int = 0,
+        my_best: Optional[float] = None,
+        my_statuses: Optional[set] = None,
+        relation: str = "CREATED",
+    ) -> ChallengeSummary:
+        my_statuses = my_statuses or set()
+        return ChallengeSummary(
+            id=c.id,
+            title=c.title,
+            description=c.description,
+            question_count=c.question_count,
+            time_limit_minutes=c.time_limit_minutes,
+            visibility=c.visibility,
+            status=c.status,
+            share_token=c.share_token,
+            creator_id=c.creator_id,
+            creator_name=creator.full_name if creator else None,
+            created_at=c.created_at,
+            expires_at=c.expires_at,
+            attempt_count=attempt_count,
+            my_best_score=my_best,
+            subject_name=c.subject_name,
+            subject_names=[str(n) for n in (c.subjects_list)],
+            difficulty=c.difficulty,
+            exam_name=c.exam_name,
+            years=[int(y) for y in (c.years or [])],
+            has_attempted=ChallengeAttemptStatus.SUBMITTED in my_statuses,
+            has_in_progress=ChallengeAttemptStatus.IN_PROGRESS in my_statuses,
+            relation=relation,
+        )
+
+    async def create_challenge(
+        self, creator: User, payload: CreateChallengeRequest
+    ) -> ChallengeSummary:
+        # One or more exams (exam_type_ids), or the legacy single exam_type_id; none means any exam
+        exam_type_ids = list(dict.fromkeys(payload.exam_type_ids or ([payload.exam_type_id] if payload.exam_type_id else [])))
+        exam_types: List[ExamType] = []
+        for type_id in exam_type_ids:
+            exam_type = await self.session.get(ExamType, type_id)
+            if not exam_type or not exam_type.is_active:
+                raise HTTPException(status_code=400, detail="Selected exam is not available.")
+            exam_types.append(exam_type)
+        years = sorted({int(y) for y in payload.years}, reverse=True)
+
+        # Trim, drop blanks, and de-duplicate case-insensitively (first spelling wins).
+        subject_names = list({n.strip().lower(): n.strip() for n in reversed(payload.subject_names) if n and n.strip()}.values())[::-1]
+        legacy_subject = (payload.subject_name or "").strip() or None
+        questions = await self._sample_questions(
+            subject_names, payload.difficulty, payload.question_count, exam_types, years, legacy_subject
+        )
+        if not questions:
+            raise HTTPException(
+                status_code=400,
+                detail="No published questions match the selected exam/year/subject/difficulty. Try broadening your filters.",
+            )
+
+        delta = DURATION_DELTAS[payload.duration]
+        expires_at = (datetime.now(timezone.utc) + delta) if delta else None
+
+        challenge = Challenge(
+            creator_id=creator.id,
+            title=payload.title,
+            description=payload.description,
+            question_count=len(questions),
+            difficulty=payload.difficulty,
+            subject_name=(", ".join(subject_names) if subject_names else legacy_subject),
+            subject_names=subject_names or None,
+            # The id only when there is exactly one exam; the name lists them all, for display
+            exam_type_id=exam_types[0].id if len(exam_types) == 1 else None,
+            exam_name=(", ".join(et.name for et in exam_types)[:200] or None),
+            years=years or None,
+            time_limit_minutes=payload.time_limit_minutes,
+            visibility=payload.visibility,
+            share_token=secrets.token_urlsafe(12),
+            expires_at=expires_at,
+        )
+        self.session.add(challenge)
+        await self.session.flush()
+
+        for idx, q in enumerate(questions):
+            self.session.add(
+                ChallengeQuestion(challenge_id=challenge.id, question_id=q.id, order_index=idx)
+            )
+
+        await self.session.commit()
+        await self.session.refresh(challenge)
+        return self._to_summary(challenge, creator)
+
+    async def _get_challenge_or_404(self, challenge_id: int) -> Challenge:
+        challenge = await self.session.get(Challenge, challenge_id)
+        if not challenge:
+            raise HTTPException(status_code=404, detail="Challenge not found")
+        return challenge
+
+    async def _resolve_challenge(self, id_or_token: str) -> Challenge:
+        if str(id_or_token).isdigit():
+            challenge = await self.session.get(Challenge, int(id_or_token))
+        else:
+            res = await self.session.exec(
+                select(Challenge).where(Challenge.share_token == id_or_token)
+            )
+            challenge = res.first()
+        if not challenge:
+            raise HTTPException(status_code=404, detail="Challenge not found")
+        return challenge
+
+    async def _assert_can_view(self, challenge: Challenge, user: User) -> None:
+        if challenge.visibility == ChallengeVisibility.PUBLIC:
+            return
+        if challenge.creator_id == user.id:
+            return
+        res = await self.session.exec(
+            select(ChallengeInvite).where(
+                ChallengeInvite.challenge_id == challenge.id,
+                ChallengeInvite.invited_user_id == user.id,
+            )
+        )
+        if res.first():
+            return
+        raise HTTPException(status_code=403, detail="You do not have access to this challenge")
+
+    async def get_public_preview(self, share_token: str) -> ChallengePublicPreview:
+        res = await self.session.exec(select(Challenge).where(Challenge.share_token == share_token))
+        challenge = res.first()
+        if not challenge:
+            raise HTTPException(status_code=404, detail="Challenge not found")
+        creator = await self.session.get(User, challenge.creator_id)
+        is_expired = _is_expired(challenge.expires_at)
+        return ChallengePublicPreview(
+            id=challenge.id,
+            title=challenge.title,
+            description=challenge.description,
+            question_count=challenge.question_count,
+            time_limit_minutes=challenge.time_limit_minutes,
+            creator_name=creator.full_name if creator else None,
+            share_token=challenge.share_token,
+            expires_at=challenge.expires_at,
+            is_expired=is_expired,
+            visibility=challenge.visibility,
+        )
+
+    async def list_my_challenges(self, user: User) -> List[ChallengeSummary]:
+        created_res = await self.session.exec(
+            select(Challenge).where(Challenge.creator_id == user.id).order_by(Challenge.created_at.desc())
+        )
+        created = list(created_res.all())
+
+        invited_res = await self.session.exec(
+            select(Challenge)
+            .join(ChallengeInvite, ChallengeInvite.challenge_id == Challenge.id)
+            .where(ChallengeInvite.invited_user_id == user.id)
+            .order_by(Challenge.created_at.desc())
+        )
+        invited = list(invited_res.all())
+
+        # Public challenges the user opened from a link and took (or started), so they can find them again
+        joined_res = await self.session.exec(
+            select(Challenge)
+            .join(ChallengeAttempt, ChallengeAttempt.challenge_id == Challenge.id)
+            .where(ChallengeAttempt.user_id == user.id)
+            .order_by(Challenge.created_at.desc())
+        )
+        joined = list(joined_res.all())
+
+        seen_ids = set()
+        combined: List[Challenge] = []
+        relation: Dict[int, str] = {}
+        for label, group in (("CREATED", created), ("INVITED", invited), ("JOINED", joined)):
+            for c in group:
+                if c.id not in seen_ids:
+                    seen_ids.add(c.id)
+                    combined.append(c)
+                    relation[c.id] = label
+        combined.sort(key=lambda c: c.created_at, reverse=True)
+
+        summaries: List[ChallengeSummary] = []
+        c_ids = [c.id for c in combined if c.id is not None]
+
+        # 1. Bulk aggregate attempt counts and user best scores
+        stats_map: Dict[int, tuple] = {}
+        if c_ids:
+            stats_stmt = (
+                select(
+                    ChallengeAttempt.challenge_id,
+                    func.count().label("attempt_count"),
+                    func.max(case((ChallengeAttempt.user_id == user.id, ChallengeAttempt.total_score), else_=None)).label("my_best"),
+                )
+                .where(
+                    ChallengeAttempt.challenge_id.in_(c_ids),
+                    ChallengeAttempt.status == ChallengeAttemptStatus.SUBMITTED,
+                )
+                .group_by(ChallengeAttempt.challenge_id)
+            )
+            for row in (await self.session.exec(stats_stmt)).all():
+                stats_map[row[0]] = (row[1] or 0, row[2])
+
+        # 1b. Which of these the user has already submitted / has in progress
+        my_status_map: Dict[int, set] = {}
+        if c_ids:
+            mine = (
+                await self.session.exec(
+                    select(ChallengeAttempt.challenge_id, ChallengeAttempt.status).where(
+                        ChallengeAttempt.challenge_id.in_(c_ids), ChallengeAttempt.user_id == user.id
+                    )
+                )
+            ).all()
+            for cid, st in mine:
+                my_status_map.setdefault(cid, set()).add(st)
+
+        # 2. Bulk load external creators in 1 query
+        other_creator_ids = list({c.creator_id for c in combined if c.creator_id and c.creator_id != user.id})
+        creators_map: Dict[int, User] = {}
+        if other_creator_ids:
+            users_res = await self.session.exec(select(User).where(User.id.in_(other_creator_ids)))
+            creators_map = {u.id: u for u in users_res.all()}
+
+        for c in combined:
+            attempt_count, my_best = stats_map.get(c.id, (0, None))
+            creator = user if c.creator_id == user.id else creators_map.get(c.creator_id)
+            summaries.append(
+                self._to_summary(c, creator, attempt_count, my_best, my_status_map.get(c.id), relation[c.id])
+            )
+        return summaries
+
+    async def get_challenge_summary(self, challenge_id: int, user: User) -> ChallengeSummary:
+        challenge = await self._get_challenge_or_404(challenge_id)
+        await self._assert_can_view(challenge, user)
+
+        creator = user if challenge.creator_id == user.id else await self.session.get(User, challenge.creator_id)
+        attempt_count = (await self.session.exec(
+            select(func.count()).select_from(ChallengeAttempt).where(
+                ChallengeAttempt.challenge_id == challenge.id,
+                ChallengeAttempt.status == ChallengeAttemptStatus.SUBMITTED,
+            )
+        )).one()
+        my_best = (await self.session.exec(
+            select(func.max(ChallengeAttempt.total_score)).where(
+                ChallengeAttempt.challenge_id == challenge.id,
+                ChallengeAttempt.user_id == user.id,
+                ChallengeAttempt.status == ChallengeAttemptStatus.SUBMITTED,
+            )
+        )).one()
+        my_statuses = set(
+            (
+                await self.session.exec(
+                    select(ChallengeAttempt.status).where(
+                        ChallengeAttempt.challenge_id == challenge.id,
+                        ChallengeAttempt.user_id == user.id,
+                    )
+                )
+            ).all()
+        )
+        if challenge.creator_id == user.id:
+            relation = "CREATED"
+        elif (await self.session.exec(select(ChallengeInvite.id).where(
+            ChallengeInvite.challenge_id == challenge.id, ChallengeInvite.invited_user_id == user.id
+        ))).first():
+            relation = "INVITED"
+        else:
+            relation = "JOINED" if my_statuses else "VIEWING"
+        return self._to_summary(challenge, creator, attempt_count or 0, my_best, my_statuses, relation)
+
+    async def invite_user(self, challenge_id: int, inviter: User, email: str) -> ChallengeInvitee:
+        challenge = await self._get_challenge_or_404(challenge_id)
+        if challenge.creator_id != inviter.id:
+            raise HTTPException(status_code=403, detail="Only the creator can invite users")
+        if _is_expired(challenge.expires_at):
+            raise HTTPException(status_code=400, detail="This challenge has closed, so no one new can join.")
+
+        # Emails are stored in lower case; match whatever case was typed
+        res = await self.session.exec(select(User).where(func.lower(User.email) == email.strip().lower()))
+        invited_user = res.first()
+        if not invited_user:
+            raise HTTPException(status_code=404, detail="No ExamPlanner student has that email. Ask them to sign up first.")
+        if invited_user.id == inviter.id:
+            raise HTTPException(status_code=400, detail="That's your own email.")
+
+        existing = await self.session.exec(
+            select(ChallengeInvite).where(
+                ChallengeInvite.challenge_id == challenge_id,
+                ChallengeInvite.invited_user_id == invited_user.id,
+            )
+        )
+        invite = existing.first()
+        if invite is None:
+            invite = ChallengeInvite(
+                challenge_id=challenge_id,
+                invited_user_id=invited_user.id,
+                invited_by_id=inviter.id,
+                status=ChallengeInviteStatus.PENDING,
+            )
+            self.session.add(invite)
+            # Tell them under the bell; inviting the same person again doesn't notify twice
+            self.session.add(UserNotification(
+                user_id=invited_user.id,
+                title=f"{inviter.full_name or 'A friend'} challenged you",
+                message=f"{challenge.title}: {challenge.question_count} questions in {challenge.time_limit_minutes} minutes.",
+                notification_type=CHALLENGE_INVITE_NOTIFICATION,
+                action_url=f"/challenges/{challenge.id}",
+            ))
+            await self.session.commit()
+            await self.session.refresh(invite)
+        return ChallengeInvitee(
+            user_id=invited_user.id, name=invited_user.full_name or invited_user.email,
+            email=invited_user.email, invited_at=invite.created_at,
+        )
+
+    async def list_invitees(self, challenge_id: int, user: User) -> List[ChallengeInvitee]:
+        """Who the creator has invited, newest first, and whether each has taken it yet."""
+        challenge = await self._get_challenge_or_404(challenge_id)
+        if challenge.creator_id != user.id:
+            raise HTTPException(status_code=403, detail="Only the creator can see who is invited")
+        rows = (await self.session.exec(
+            select(ChallengeInvite, User)
+            .join(User, User.id == ChallengeInvite.invited_user_id)
+            .where(ChallengeInvite.challenge_id == challenge_id)
+            .order_by(ChallengeInvite.created_at.desc())
+        )).all()
+        scores = {
+            uid: score for uid, score in (await self.session.exec(
+                select(ChallengeAttempt.user_id, ChallengeAttempt.total_score).where(
+                    ChallengeAttempt.challenge_id == challenge_id,
+                    ChallengeAttempt.status == ChallengeAttemptStatus.SUBMITTED,
+                )
+            )).all()
+        }
+        return [
+            ChallengeInvitee(
+                user_id=u.id, name=u.full_name or u.email, email=u.email, invited_at=inv.created_at,
+                has_attempted=u.id in scores, score=scores.get(u.id),
+            )
+            for inv, u in rows
+        ]
+
+    async def _build_question_cards(
+        self, questions: List[ChallengeQuestion], language: LanguageCode = LanguageCode.ENGLISH
+    ) -> List[ChallengeQuestionOut]:
+        q_ids = [cq.question_id for cq in questions]
+        if not q_ids:
+            return []
+
+        qt_res = await self.session.exec(
+            select(QuestionTranslation).where(QuestionTranslation.question_id.in_(q_ids))
+        )
+        qt_map: Dict[int, Dict[str, str]] = {}
+        for qt in qt_res.all():
+            qt_map.setdefault(qt.question_id, {})[qt.language] = qt.question_text
+
+        opt_res = await self.session.exec(
+            select(QuestionOption)
+            .where(QuestionOption.question_id.in_(q_ids))
+            .order_by(QuestionOption.question_id, QuestionOption.display_order)
+        )
+        options = list(opt_res.all())
+        opt_ids = [o.id for o in options]
+
+        ot_map: Dict[int, Dict[str, str]] = {}
+        if opt_ids:
+            ot_res = await self.session.exec(
+                select(OptionTranslation).where(OptionTranslation.option_id.in_(opt_ids))
+            )
+            for ot in ot_res.all():
+                ot_map.setdefault(ot.option_id, {})[ot.language] = ot.option_text
+
+        opt_by_question: Dict[int, list] = {}
+        for o in options:
+            opt_by_question.setdefault(o.question_id, []).append(o)
+
+        lang_key = language.value if hasattr(language, "value") else str(language)
+        cards: List[ChallengeQuestionOut] = []
+        for cq in questions:
+            q_trans = qt_map.get(cq.question_id, {})
+            text = q_trans.get(lang_key) or (next(iter(q_trans.values())) if q_trans else "")
+            opts_out = []
+            for o in opt_by_question.get(cq.question_id, []):
+                o_trans = ot_map.get(o.id, {})
+                o_text = o_trans.get(lang_key) or (next(iter(o_trans.values())) if o_trans else o.option_label)
+                opts_out.append(
+                    ChallengeQuestionOption(option_id=o.id, option_label=o.option_label, text=o_text)
+                )
+            cards.append(
+                ChallengeQuestionOut(
+                    question_id=cq.question_id,
+                    order_index=cq.order_index,
+                    text=text,
+                    options=opts_out,
+                )
+            )
+        cards.sort(key=lambda c: c.order_index)
+        return cards
+
+    async def start_attempt(self, id_or_token: str, user: User) -> StartChallengeAttemptResponse:
+        challenge = await self._resolve_challenge(id_or_token)
+        await self._assert_can_view(challenge, user)
+
+        existing_res = await self.session.exec(
+            select(ChallengeAttempt).where(
+                ChallengeAttempt.challenge_id == challenge.id,
+                ChallengeAttempt.user_id == user.id,
+                ChallengeAttempt.status == ChallengeAttemptStatus.IN_PROGRESS,
+            )
+        )
+        attempt = existing_res.first()
+        if not attempt:
+            already_submitted = (
+                await self.session.exec(
+                    select(ChallengeAttempt.id).where(
+                        ChallengeAttempt.challenge_id == challenge.id,
+                        ChallengeAttempt.user_id == user.id,
+                        ChallengeAttempt.status == ChallengeAttemptStatus.SUBMITTED,
+                    )
+                )
+            ).first()
+            if already_submitted:
+                raise HTTPException(
+                    status_code=409,
+                    detail="You have already attempted this challenge. Each challenge can be attempted only once.",
+                )
+            if _is_expired(challenge.expires_at):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This challenge closed on {challenge.expires_at.isoformat()} and is no longer accepting new attempts.",
+                )
+            attempt = ChallengeAttempt(challenge_id=challenge.id, user_id=user.id)
+            self.session.add(attempt)
+            await self.session.commit()
+            await self.session.refresh(attempt)
+
+        cq_res = await self.session.exec(
+            select(ChallengeQuestion)
+            .where(ChallengeQuestion.challenge_id == challenge.id)
+            .order_by(ChallengeQuestion.order_index)
+        )
+        questions = await self._build_question_cards(list(cq_res.all()))
+
+        return StartChallengeAttemptResponse(
+            attempt_id=attempt.id,
+            challenge_id=challenge.id,
+            questions=questions,
+            time_limit_minutes=challenge.time_limit_minutes,
+        )
+
+    async def _get_attempt_or_404(self, attempt_id: int, user: User) -> ChallengeAttempt:
+        attempt = await self.session.get(ChallengeAttempt, attempt_id)
+        if not attempt or attempt.user_id != user.id:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+        return attempt
+
+    async def save_response(
+        self, attempt_id: int, user: User, question_id: int,
+        selected_option_id: Optional[int], time_spent_seconds: float,
+    ) -> None:
+        attempt = await self._get_attempt_or_404(attempt_id, user)
+        if attempt.status != ChallengeAttemptStatus.IN_PROGRESS:
+            raise HTTPException(status_code=400, detail="Attempt already submitted")
+
+        belongs_res = await self.session.exec(
+            select(ChallengeQuestion).where(
+                ChallengeQuestion.challenge_id == attempt.challenge_id,
+                ChallengeQuestion.question_id == question_id,
+            )
+        )
+        if not belongs_res.first():
+            raise HTTPException(status_code=400, detail="Question does not belong to this challenge")
+
+        is_correct = False
+        if selected_option_id is not None:
+            option = await self.session.get(QuestionOption, selected_option_id)
+            is_correct = bool(option and option.is_correct and option.question_id == question_id)
+
+        res = await self.session.exec(
+            select(ChallengeResponse).where(
+                ChallengeResponse.attempt_id == attempt_id,
+                ChallengeResponse.question_id == question_id,
+            )
+        )
+        response = res.first()
+        if response:
+            response.selected_option_id = selected_option_id
+            response.is_correct = is_correct
+            response.time_spent_seconds = time_spent_seconds
+            response.answered_at = datetime.now(timezone.utc)
+        else:
+            response = ChallengeResponse(
+                attempt_id=attempt_id,
+                question_id=question_id,
+                selected_option_id=selected_option_id,
+                is_correct=is_correct,
+                time_spent_seconds=time_spent_seconds,
+            )
+        self.session.add(response)
+        await self.session.commit()
+
+    async def submit_attempt(self, attempt_id: int, user: User) -> SubmitChallengeAttemptResponse:
+        attempt = await self._get_attempt_or_404(attempt_id, user)
+        if attempt.status == ChallengeAttemptStatus.SUBMITTED:
+            return SubmitChallengeAttemptResponse(
+                attempt_id=attempt.id,
+                total_score=attempt.total_score,
+                total_correct=attempt.total_correct,
+                total_incorrect=attempt.total_incorrect,
+                total_unattempted=attempt.total_unattempted,
+                time_spent_seconds=attempt.time_spent_seconds,
+            )
+
+        total_questions = (await self.session.exec(
+            select(func.count()).select_from(ChallengeQuestion).where(
+                ChallengeQuestion.challenge_id == attempt.challenge_id
+            )
+        )).one()
+        responses_res = await self.session.exec(
+            select(ChallengeResponse).where(ChallengeResponse.attempt_id == attempt_id)
+        )
+        responses = list(responses_res.all())
+
+        correct = sum(1 for r in responses if r.is_correct)
+        answered = sum(1 for r in responses if r.selected_option_id is not None)
+        incorrect = answered - correct
+        unattempted = max(0, (total_questions or 0) - answered)
+        time_spent = sum(r.time_spent_seconds for r in responses)
+
+        attempt.total_correct = correct
+        attempt.total_incorrect = incorrect
+        attempt.total_unattempted = unattempted
+        attempt.total_score = float(correct)
+        attempt.time_spent_seconds = time_spent
+        attempt.status = ChallengeAttemptStatus.SUBMITTED
+        attempt.submitted_at = datetime.now(timezone.utc)
+        self.session.add(attempt)
+        await self.session.commit()
+        await self.session.refresh(attempt)
+
+        return SubmitChallengeAttemptResponse(
+            attempt_id=attempt.id,
+            total_score=attempt.total_score,
+            total_correct=attempt.total_correct,
+            total_incorrect=attempt.total_incorrect,
+            total_unattempted=attempt.total_unattempted,
+            time_spent_seconds=attempt.time_spent_seconds,
+        )
+
+    async def get_leaderboard(self, challenge_id: int, user: User) -> List[LeaderboardEntry]:
+        challenge = await self._get_challenge_or_404(challenge_id)
+        await self._assert_can_view(challenge, user)
+
+        res = await self.session.exec(
+            select(ChallengeAttempt)
+            .where(
+                ChallengeAttempt.challenge_id == challenge_id,
+                ChallengeAttempt.status == ChallengeAttemptStatus.SUBMITTED,
+            )
+            .order_by(ChallengeAttempt.total_score.desc(), ChallengeAttempt.time_spent_seconds.asc())
+        )
+        attempts = list(res.all())
+        user_ids = list({a.user_id for a in attempts})
+        users_map: Dict[int, User] = {}
+        if user_ids:
+            u_res = await self.session.exec(select(User).where(User.id.in_(user_ids)))
+            users_map = {u.id: u for u in u_res.all()}
+
+        entries: List[LeaderboardEntry] = []
+        for a in attempts:
+            u = users_map.get(a.user_id)
+            entries.append(
+                LeaderboardEntry(
+                    user_id=a.user_id,
+                    user_name=u.full_name if u else "Unknown",
+                    total_score=a.total_score,
+                    total_correct=a.total_correct,
+                    time_spent_seconds=a.time_spent_seconds,
+                    submitted_at=a.submitted_at,
+                    is_current_user=(a.user_id == user.id),
+                )
+            )
+        return entries

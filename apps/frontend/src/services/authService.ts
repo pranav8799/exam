@@ -1,0 +1,511 @@
+import { UserRole, AuthResponse } from '../types/auth';
+import { SUPERADMIN_APP_URL } from '../utils/superAdminApp';
+import { getGuestAttempts, clearGuestAttempts } from '../utils/guestStorage';
+import { guardedFetch, registerTokenRefreshHandler } from '../utils/apiGuard';
+
+const API_BASE_URL = '/api/v1/auth';
+
+/**
+ * Super Admin sessions must never live in this app's browser storage (see utils/superAdminApp).
+ * The server has just issued a session, so revoke it and send the user to the Super Admin app.
+ */
+async function rejectSuperAdminSession(data: AuthResponse): Promise<void> {
+  if (data.user?.role !== UserRole.SUPER_ADMIN) return;
+  if (data.access_token) {
+    await fetch(`${API_BASE_URL}/logout`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { Authorization: `Bearer ${data.access_token}` },
+    }).catch(() => undefined);
+  }
+  throw new Error(
+    SUPERADMIN_APP_URL
+      ? `Super Admin accounts sign in at ${SUPERADMIN_APP_URL}`
+      : 'Super Admin accounts sign in on the separate Super Admin portal.',
+  );
+}
+
+let activeRefreshPromise: Promise<string> | null = null;
+let refreshTimerId: any = null;
+
+/**
+ * Proactive Silent Token Refresh
+ * Calculates remaining token lifetime from JWT payload and schedules refresh
+ * 2 minutes prior to expiration.
+ */
+export function scheduleProactiveRefresh(token?: string): void {
+  if (refreshTimerId) {
+    clearTimeout(refreshTimerId);
+    refreshTimerId = null;
+  }
+
+  const currentToken = token || localStorage.getItem('access_token');
+  if (!currentToken) return;
+
+  try {
+    const parts = currentToken.split('.');
+    if (parts.length !== 3) return;
+    const payload = JSON.parse(atob(parts[1]));
+    if (!payload.exp) return;
+
+    const expiresAtMs = payload.exp * 1000;
+    const nowMs = Date.now();
+    // Proactively refresh 2 minutes (120,000 ms) before expiration
+    const refreshDelayMs = expiresAtMs - nowMs - (2 * 60 * 1000);
+
+    if (refreshDelayMs <= 0) {
+      refreshAccessToken().catch((err) => {
+        console.warn('Immediate proactive refresh failed:', err);
+      });
+    } else {
+      refreshTimerId = setTimeout(() => {
+        refreshAccessToken().catch((err) => {
+          console.warn('Scheduled silent refresh failed:', err);
+        });
+      }, Math.min(refreshDelayMs, 2147483647));
+    }
+  } catch (err) {
+    console.warn('Failed to parse JWT for proactive refresh:', err);
+  }
+}
+
+/**
+ * Exchanges the HTTP-only refresh token cookie with /api/v1/auth/refresh for a new access token.
+ * In-flight calls are deduplicated so parallel requests share a single refresh execution.
+ */
+export async function refreshAccessToken(): Promise<string> {
+  if (activeRefreshPromise) {
+    return activeRefreshPromise;
+  }
+
+  activeRefreshPromise = (async () => {
+    const tokenBefore = localStorage.getItem('access_token');
+    try {
+      const res = await fetch(`${API_BASE_URL}/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+      });
+
+      if (!res.ok) {
+        const tokenAfter = localStorage.getItem('access_token');
+        if (tokenBefore === tokenAfter) {
+          logoutUser();
+          window.dispatchEvent(new Event('auth_expired'));
+        }
+        throw new Error('SESSION_EXPIRED');
+      }
+
+      const data: AuthResponse = await res.json();
+      await rejectSuperAdminSession(data);
+      if (data.access_token) {
+        localStorage.setItem('access_token', data.access_token);
+        if (data.user) {
+          localStorage.setItem('user', JSON.stringify(data.user));
+        }
+        window.dispatchEvent(new Event('user_profile_updated'));
+        scheduleProactiveRefresh(data.access_token);
+        return data.access_token;
+      }
+      throw new Error('NO_TOKEN_IN_RESPONSE');
+    } finally {
+      activeRefreshPromise = null;
+    }
+  })();
+
+  return activeRefreshPromise;
+}
+
+// Automatically bind refresh handler to guardedFetch for 401 retry handling
+registerTokenRefreshHandler(refreshAccessToken);
+
+export function initSilentRefresh(): void {
+  scheduleProactiveRefresh();
+}
+
+/**
+ * Hydrates the user session on application startup or window focus.
+ * If access_token exists, schedules proactive refresh.
+ * If missing, attempts silent refresh via HttpOnly refresh_token cookie.
+ */
+export async function hydrateSession(): Promise<boolean> {
+  const token = localStorage.getItem('access_token');
+  if (token) {
+    scheduleProactiveRefresh(token);
+    return true;
+  }
+  try {
+    await refreshAccessToken();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function syncGuestSessionsOnAuth(token: string): Promise<string | null> {
+  const attempts = getGuestAttempts();
+  if (!attempts || attempts.length === 0) return null;
+
+  try {
+    const res = await fetch('/api/v1/attempts/sync-guest-sessions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({ sessions_payload: attempts }),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      clearGuestAttempts();
+      const latestId = data?.latest_attempt_id || null;
+      if (latestId) {
+        sessionStorage.setItem('latest_synced_attempt_id', latestId);
+      }
+      console.log('Successfully synced guest exam attempts to candidate account:', latestId);
+      return latestId;
+    } else {
+      const errText = await res.text();
+      console.warn('Sync guest sessions API returned error status:', res.status, errText);
+    }
+
+  } catch (err) {
+    console.warn('Failed to sync guest exam attempts during authentication:', err);
+  }
+  return null;
+}
+
+export async function loginUser(email: string, password: string, role?: UserRole): Promise<AuthResponse> {
+  const res = await fetch(`${API_BASE_URL}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ email, password, role }),
+  });
+
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ detail: 'Authentication failed' }));
+    const message = errorData.detail || 'Invalid email or password.';
+    
+    if (res.status === 401 || res.status === 404 || message.toLowerCase().includes('not found') || message.toLowerCase().includes('incorrect email')) {
+      const err = new Error('USER_NOT_FOUND');
+      (err as any).userFriendlyMessage = 'User not found! Please register first.';
+      throw err;
+    }
+    throw new Error(message);
+  }
+
+  const data: AuthResponse = await res.json();
+  await rejectSuperAdminSession(data);
+  if (data.access_token && data.user) {
+    localStorage.setItem('access_token', data.access_token);
+    localStorage.setItem('user', JSON.stringify(data.user));
+    scheduleProactiveRefresh(data.access_token);
+    await syncGuestSessionsOnAuth(data.access_token);
+  }
+  return data;
+}
+
+export interface ClerkUserInfo {
+  email?: string;
+  fullName?: string;
+  profileImage?: string;
+}
+
+/**
+ * Exchanges a Clerk OAuth session token for our own access/refresh tokens.
+ * This is the only point where a Clerk-issued token is ever sent anywhere —
+ * afterward the app behaves exactly like an email/password login (same
+ * storage, same proactive refresh, same guest-session sync).
+ */
+/** A failed POST /auth/clerk-exchange; `status` lets the caller tell a retryable failure from a rejection. */
+export class ClerkExchangeError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = 'ClerkExchangeError';
+  }
+
+  /** 401 (token not ready yet), 408/429 and 5xx can succeed on retry; other 4xx are final (inactive/staff account). */
+  get isRetryable(): boolean {
+    return this.status === 401 || this.status === 408 || this.status === 429 || this.status >= 500;
+  }
+}
+
+export async function exchangeClerkToken(
+  clerkToken: string,
+  userInfo?: ClerkUserInfo
+): Promise<AuthResponse> {
+  const res = await fetch(`${API_BASE_URL}/clerk-exchange`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({
+      clerk_token: clerkToken,
+      email: userInfo?.email,
+      full_name: userInfo?.fullName,
+      profile_image: userInfo?.profileImage,
+    }),
+  });
+
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ detail: 'Clerk exchange failed' }));
+    throw new ClerkExchangeError(errorData.detail || 'Could not complete sign-in.', res.status);
+  }
+
+  const data: AuthResponse = await res.json();
+  await rejectSuperAdminSession(data).catch((err: Error) => {
+    throw new ClerkExchangeError(err.message, 403);
+  });
+  if (data.access_token && data.user) {
+    localStorage.setItem('access_token', data.access_token);
+    localStorage.setItem('user', JSON.stringify(data.user));
+    scheduleProactiveRefresh(data.access_token);
+    // Let route guards pick up the session now rather than after the guest-attempt sync.
+    window.dispatchEvent(new Event('user_profile_updated'));
+    await syncGuestSessionsOnAuth(data.access_token);
+  }
+  return data;
+}
+
+export async function registerUser(
+  email: string,
+  password: string,
+  fullName: string,
+  role: UserRole = UserRole.STUDENT,
+  organizationName?: string,
+  department?: string,
+  preferredLanguage?: string
+): Promise<AuthResponse> {
+  const res = await fetch(`${API_BASE_URL}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({
+      email,
+      password,
+      full_name: fullName,
+      role,
+      organization_name: organizationName,
+      department,
+      preferred_language: preferredLanguage,
+    }),
+  });
+
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ detail: 'Registration failed' }));
+    throw new Error(errorData.detail || 'Could not register user.');
+  }
+
+  const data: AuthResponse = await res.json();
+  if (data.access_token && data.user) {
+    localStorage.setItem('access_token', data.access_token);
+    localStorage.setItem('user', JSON.stringify(data.user));
+    scheduleProactiveRefresh(data.access_token);
+    await syncGuestSessionsOnAuth(data.access_token);
+  }
+  return data;
+}
+
+
+export function logoutUser(): void {
+  if (refreshTimerId) {
+    clearTimeout(refreshTimerId);
+    refreshTimerId = null;
+  }
+  activeRefreshPromise = null;
+
+  const token = localStorage.getItem('access_token');
+  try {
+    fetch(`${API_BASE_URL}/logout`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: token ? { 'Authorization': `Bearer ${token}` } : undefined,
+    }).catch((err) => {
+      console.warn('Backend logout request failed:', err);
+    });
+  } catch {
+    // Ignore network error on logout
+  }
+
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('user');
+  localStorage.removeItem('latest_synced_attempt_id');
+  try {
+    sessionStorage.clear();
+  } catch (e) {
+    console.warn("Error clearing sessionStorage during logout:", e);
+  }
+}
+
+/**
+ * Dual Authentication Service
+ * 
+ * Note on Token Expiration & Silent Refresh (HLD/LLD Frontend Part D Item 2):
+ * - Clerk manages token refreshing automatically via its client session SDK.
+ * - For custom backend JWTs, proactive silent refresh (scheduleProactiveRefresh) and
+ *   guardedFetch 401 retry interceptor are fully active and wired to /api/v1/auth/refresh.
+ */
+export async function fetchCurrentUser(customToken?: string): Promise<any> {
+  const token = customToken || localStorage.getItem('access_token');
+  if (!token) throw new Error('No access token found');
+
+  const res = await guardedFetch(`${API_BASE_URL}/me`, {
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  });
+
+  if (!res.ok) {
+    throw new Error('Failed to fetch user profile');
+  }
+
+  const data = await res.json();
+  localStorage.setItem('user', JSON.stringify(data));
+  return data;
+}
+
+export interface UserProfileUpdate {
+  full_name?: string;
+  profile_image?: string;
+  email?: string;
+  preferred_language?: string;
+  phone?: string;
+  target_exam?: string;
+  target_year?: string;
+  optional_subject?: string;
+  weekly_hours?: string;
+  state?: string;
+  username?: string;
+  leaderboard_display?: 'USERNAME' | 'NAME';
+  weekly_email_enabled?: boolean;
+  weekly_email_day?: number;
+  weekly_email_hour?: number;
+  // Replaces all subject ratings; {} clears them.
+  subject_proficiency?: Record<string, number>;
+}
+
+export async function updateUserProfile(updateData: UserProfileUpdate, customToken?: string): Promise<any> {
+  const token = customToken || localStorage.getItem('access_token');
+  if (!token) throw new Error('No access token found');
+
+  const res = await fetch(`${API_BASE_URL}/me`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify(updateData)
+  });
+
+  if (!res.ok) {
+    // Surface the server's reason (e.g. "Target exam and target year can't be empty.")
+    const detail = await res.json().then((b) => b?.detail).catch(() => null);
+    throw new Error(typeof detail === 'string' ? detail : 'Failed to update user profile');
+  }
+
+  const data = await res.json();
+  localStorage.setItem('user', JSON.stringify(data));
+  window.dispatchEvent(new Event('user_profile_updated'));
+  return data;
+}
+
+export interface OnboardingPayload {
+  target_exam: string;
+  target_year: string;
+  optional_subject?: string;
+  weekly_hours: string;
+  preferred_language: string;
+  subject_proficiency?: Record<string, number>;
+}
+
+/** Saves the first-login questionnaire; the server locks the primary target from then on. */
+export async function completeOnboarding(payload: OnboardingPayload): Promise<any> {
+  const token = localStorage.getItem('access_token');
+  if (!token) throw new Error('No access token found');
+
+  const res = await fetch(`${API_BASE_URL}/me/onboarding`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const detail = typeof body?.detail === 'string' ? body.detail : Array.isArray(body?.detail) ? body.detail[0]?.msg : null;
+    throw new Error(detail || 'Could not save your details. Please try again.');
+  }
+  const data = await res.json();
+  localStorage.setItem('user', JSON.stringify(data));
+  localStorage.setItem('preferred_language', data.preferred_language || payload.preferred_language);
+  window.dispatchEvent(new Event('user_profile_updated'));
+  return data;
+}
+
+export async function verifyEmail(token: string): Promise<any> {
+  const res = await fetch(`${API_BASE_URL}/verify-email`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ detail: 'Email verification failed' }));
+    throw new Error(errorData.detail || 'Verification token is invalid or expired.');
+  }
+
+  return await res.json();
+}
+
+export async function forgotPassword(email: string): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}/forgot-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ detail: 'Request failed' }));
+    throw new Error(errorData.detail || 'Failed to send reset email.');
+  }
+}
+
+export async function resetPassword(token: string, newPassword: string): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}/reset-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, new_password: newPassword }),
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ detail: 'Reset failed' }));
+    throw new Error(errorData.detail || 'Invalid or expired reset link.');
+  }
+}
+
+/**
+ * Sets a new password for the signed-in user (also clears the temporary-password flag) and
+ * replaces the stored session with the fresh one the server issues.
+ */
+export async function changePassword(currentPassword: string, newPassword: string): Promise<AuthResponse> {
+  const token = localStorage.getItem('access_token');
+  if (!token) throw new Error('You are signed out. Please sign in again.');
+
+  const res = await fetch(`${API_BASE_URL}/change-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    credentials: 'include',
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const detail = typeof body?.detail === 'string' ? body.detail : Array.isArray(body?.detail) ? body.detail[0]?.msg : null;
+    throw new Error(detail || 'Could not change the password.');
+  }
+
+  const data: AuthResponse = await res.json();
+  if (data.access_token && data.user) {
+    localStorage.setItem('access_token', data.access_token);
+    localStorage.setItem('user', JSON.stringify(data.user));
+    scheduleProactiveRefresh(data.access_token);
+    window.dispatchEvent(new Event('user_profile_updated'));
+  }
+  return data;
+}

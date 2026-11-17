@@ -1,0 +1,153 @@
+import React from 'react';
+import { Users, GraduationCap } from 'lucide-react';
+import { SystemStats } from '../../types/auth';
+import { SuperAdminTab } from './SuperAdminTabNav';
+
+interface SuperAdminStatsProps {
+  stats: SystemStats | null;
+  loading: boolean;
+  onSelectTab?: (tab: SuperAdminTab) => void;
+}
+
+export function SuperAdminStats({ stats, loading, onSelectTab }: SuperAdminStatsProps) {
+  const cards: {
+    title: string;
+    value: string | number;
+    badge: string;
+    badgeColor: string;
+    color: string;
+    bg: string;
+    border: string;
+    icon: any;
+    targetTab: SuperAdminTab;
+  }[] = [
+    {
+      title: 'Active Admins',
+      value: loading ? '...' : stats?.active_admins_count ?? 0,
+      badge: 'Verified Accounts',
+      badgeColor: '#3A8B53',
+      color: '#3A8B53',
+      bg: 'rgba(16, 185, 129, 0.12)',
+      border: 'rgba(16, 185, 129, 0.25)',
+      icon: Users,
+      targetTab: 'dashboard',
+    },
+    {
+      title: 'Active Students',
+      value: loading ? '...' : stats?.active_students_count ?? 0,
+      badge: 'Registered Candidates',
+      badgeColor: 'var(--primary-red)',
+      color: 'var(--primary-red)',
+      bg: 'rgba(var(--primary-red-rgb), 0.12)',
+      border: 'rgba(var(--primary-red-rgb), 0.25)',
+      icon: GraduationCap,
+      targetTab: 'users',
+    },
+  ];
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 20, marginBottom: 28 }}>
+      {cards.map((card, idx) => {
+        const Icon = card.icon;
+        return (
+          <div
+            key={idx}
+            onClick={() => onSelectTab && onSelectTab(card.targetTab)}
+            title={`Click to view ${card.title}`}
+            style={{
+              background: 'var(--bg-card)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 'var(--radius)',
+              padding: '24px 26px',
+              cursor: 'pointer',
+              boxShadow: '0 10px 30px -10px rgba(15, 29, 56, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.6)',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'space-between',
+              position: 'relative',
+              overflow: 'hidden',
+              transition: 'transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease',
+              fontFamily: 'Inter, sans-serif',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'translateY(-3px)';
+              e.currentTarget.style.boxShadow = '0 16px 36px -12px rgba(15, 29, 56, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.8)';
+              e.currentTarget.style.borderColor = card.border;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'translateY(0)';
+              e.currentTarget.style.boxShadow = '0 10px 30px -10px rgba(15, 29, 56, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.6)';
+              e.currentTarget.style.borderColor = 'var(--border-color)';
+            }}
+          >
+            {/* Background Ambient Glow */}
+            <div
+              style={{
+                position: 'absolute',
+                top: -20,
+                right: -20,
+                width: 100,
+                height: 100,
+                borderRadius: 'var(--radius)',
+                background: card.bg,
+                filter: 'blur(30px)',
+                pointerEvents: 'none',
+              }}
+            />
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+              <div
+                style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: 'var(--radius)',
+                  background: card.bg,
+                  border: `1px solid ${card.border}`,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.04)',
+                }}
+              >
+                <Icon size={20} color={card.color} />
+              </div>
+              <span
+                style={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  padding: '4px 12px',
+                  borderRadius: 'var(--radius)',
+                  color: card.badgeColor,
+                  background: card.bg,
+                  border: `1px solid ${card.border}`,
+                  letterSpacing: '0.04em',
+                }}
+              >
+                {card.badge}
+              </span>
+            </div>
+
+            <div>
+              <div
+                style={{
+                  fontSize: 34,
+                  fontWeight: 800,
+                  color: 'var(--text-main)',
+                  letterSpacing: '-0.03em',
+                  lineHeight: 1,
+                  marginBottom: 6,
+                  fontFamily: 'Inter, sans-serif',
+                }}
+              >
+                {card.value}
+              </div>
+              <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+                {card.title}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}

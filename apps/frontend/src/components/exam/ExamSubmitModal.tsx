@@ -1,0 +1,200 @@
+import React from 'react';
+import { Award, Loader2 } from 'lucide-react';
+import { useExamText } from '../../i18n/examText';
+
+interface ExamSubmitModalProps {
+  isOpen: boolean;
+  answeredCount?: number;
+  markedCount?: number;
+  unattemptedCount?: number;
+  summary?: {
+    answered_count: number;
+    marked_for_review_count: number;
+    unattempted_count: number;
+    total?: number;
+  };
+  isSubmitting?: boolean;
+  errorMessage?: string | null;
+  onResume?: () => void;
+  onClose?: () => void;
+  onConfirmSubmit?: () => void;
+  onConfirm?: () => void;
+}
+
+export function ExamSubmitModal({
+  isOpen,
+  answeredCount,
+  markedCount,
+  unattemptedCount,
+  summary,
+  isSubmitting = false,
+  errorMessage,
+  onResume,
+  onClose,
+  onConfirmSubmit,
+  onConfirm,
+}: ExamSubmitModalProps) {
+  const { t } = useExamText();
+  const isDark = false;
+  const ans = answeredCount ?? summary?.answered_count ?? 0;
+  const mrk = markedCount ?? summary?.marked_for_review_count ?? 0;
+  const unatt = unattemptedCount ?? summary?.unattempted_count ?? 0;
+  const handleClose = () => {
+    if (onResume) onResume();
+    else if (onClose) onClose();
+  };
+  const handleConfirm = () => {
+    if (onConfirmSubmit) onConfirmSubmit();
+    else if (onConfirm) onConfirm();
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 200,
+        backgroundColor: 'rgba(15, 23, 42, 0.75)',
+        backdropFilter: 'blur(6px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 20
+      }}
+    >
+      <div
+        style={{
+          backgroundColor: isDark ? '#0f1e3c' : 'var(--bg-card)',
+          borderRadius: 'var(--radius)',
+          border: `1px solid ${isDark ? 'rgba(255, 255, 255, 0.12)' : 'var(--border-color)'}`,
+          boxShadow: '0 24px 60px rgba(0,0,0,0.4)',
+          width: '100%',
+          maxWidth: 440,
+          padding: 28,
+          color: isDark ? '#ffffff' : 'var(--deep-navy)',
+          textAlign: 'center'
+        }}
+      >
+        <div
+          style={{
+            width: 56,
+            height: 56,
+            borderRadius: 'var(--radius)',
+            backgroundColor: isDark ? 'rgba(var(--primary-red-rgb), 0.2)' : 'var(--bg-subtle)',
+            border: '1px solid var(--primary-red)',
+            color: 'var(--primary-red)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            margin: '0 auto 16px auto'
+          }}
+        >
+          <Award size={30} />
+        </div>
+
+        <h3 style={{ fontSize: 20, fontWeight: 800, margin: '0 0 8px 0' }}>{t('submitConfirmTitle')}</h3>
+        <p style={{ fontSize: 14, color: isDark ? 'rgba(255,255,255,0.7)' : 'var(--text-muted)', margin: '0 0 20px 0', lineHeight: 1.5 }}>
+          {t('submitConfirmBody')}
+        </p>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 1fr 1fr',
+            gap: 10,
+            padding: 14,
+            borderRadius: 'var(--radius)',
+            backgroundColor: isDark ? 'rgba(255,255,255,0.04)' : 'var(--bg-subtle)',
+            border: `1px solid ${isDark ? 'rgba(255,255,255,0.08)' : 'var(--border-color)'}`,
+            marginBottom: 24
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 800, color: '#3A8B53' }}>{ans}</div>
+            <div style={{ fontSize: 11, color: isDark ? 'rgba(255,255,255,0.5)' : 'var(--text-muted)' }}>{t('answered')}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 800, color: '#F2B623' }}>{mrk}</div>
+            <div style={{ fontSize: 11, color: isDark ? 'rgba(255,255,255,0.5)' : 'var(--text-muted)' }}>{t('forReview')}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 800, color: isDark ? 'rgba(255,255,255,0.6)' : 'var(--text-muted)' }}>
+              {unatt}
+            </div>
+            <div style={{ fontSize: 11, color: isDark ? 'rgba(255,255,255,0.5)' : 'var(--text-muted)' }}>{t('left')}</div>
+          </div>
+        </div>
+
+        {errorMessage && (
+          <div
+            style={{
+              padding: '10px 14px',
+              backgroundColor: '#FEF2F2',
+              border: '1px solid #F87171',
+              color: '#991B1B',
+              fontSize: 13,
+              fontWeight: 500,
+              marginBottom: 16,
+              textAlign: 'left',
+              lineHeight: 1.4,
+            }}
+          >
+            ⚠️ {errorMessage}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 12 }}>
+          <button
+            onClick={handleClose}
+            disabled={isSubmitting}
+            style={{
+              flex: 1,
+              padding: 12,
+              borderRadius: 'var(--radius)',
+              border: `1px solid ${isDark ? 'rgba(255, 255, 255, 0.15)' : '#cbd5e1'}`,
+              backgroundColor: isDark ? 'rgba(255, 255, 255, 0.06)' : '#f8fafc',
+              color: isDark ? '#ffffff' : 'var(--deep-navy)',
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: isSubmitting ? 'not-allowed' : 'pointer',
+              opacity: isSubmitting ? 0.5 : 1,
+            }}
+          >
+            {t('resumeTest')}
+          </button>
+          <button
+            onClick={handleConfirm}
+            disabled={isSubmitting}
+            style={{
+              flex: 1,
+              padding: 12,
+              borderRadius: 'var(--radius)',
+              border: 'none',
+              backgroundColor: 'var(--primary-red)',
+              color: 'var(--bg-card)',
+              fontSize: 14,
+              fontWeight: 700,
+              cursor: isSubmitting ? 'not-allowed' : 'pointer',
+              opacity: isSubmitting ? 0.7 : 1,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8,
+            }}
+          >
+            {isSubmitting ? (
+              <>
+                <Loader2 size={16} className="animate-spin" />
+                <span>{t('submitting')}</span>
+              </>
+            ) : (
+              <span>{t('confirmSubmit')}</span>
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

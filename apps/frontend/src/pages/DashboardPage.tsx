@@ -1,0 +1,1168 @@
+import React, { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { Logo } from '../components/common/Logo';
+import { Ico } from '../components/common/Icons';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, Cell } from 'recharts';
+import { fetchCurrentUser, syncGuestSessionsOnAuth } from '../services/authService';
+import { useRefreshUserOnFocus } from '../hooks/useRefreshUserOnFocus';
+import { listExams } from '../services/examService';
+import { guardedFetch } from '../utils/apiGuard';
+import { useUser } from '@clerk/clerk-react';
+import { StudentLayout } from '../components/student/StudentLayout';
+import StudentMetricCard from '../components/student/StudentMetricCard';
+import { LogStudyModal } from '../components/student/LogStudyModal';
+import { fetchWeeklySchedule } from '../services/studyPlannerService';
+import { fetchLeaderboard } from '../services/leaderboardService';
+import { StudentMetricCardSkeleton } from '../components/student/StudentMetricCardSkeleton';
+import { useMinimumLoadingTime } from '../hooks/useMinimumLoadingTime';
+
+import { ChevronLeft, ChevronRight, Trophy, RefreshCw } from 'lucide-react';
+import { StatusBadge } from '../components/common/StatusBadge';
+import { formatEnum } from '../utils/formatEnum';
+import { SUPERADMIN_APP_URL, isSuperAdmin } from '../utils/superAdminApp';
+
+export function DashboardPage() {
+  const navigate = useNavigate();
+  const [user, setUser] = useState(JSON.parse(localStorage.getItem('user') || '{}'));
+
+  useEffect(() => {
+    if (isSuperAdmin(user)) {
+      if (SUPERADMIN_APP_URL) window.location.replace(SUPERADMIN_APP_URL);
+    } else if (user?.role === 'ADMIN') {
+      navigate('/admin', { replace: true });
+    } else if (user?.role === 'TEACHER') {
+      navigate('/teacher', { replace: true });
+    }
+  }, [user, navigate]);
+
+  const { user: clerkUser } = useUser();
+
+  const [activeExam, setActiveExam] = useState<any>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [showBadgesModal, setShowBadgesModal] = useState(false);
+  const [showLogModal, setShowLogModal] = useState(false);
+  const [badges, setBadges] = useState<{ unlocked: any[], locked: any[] }>({ unlocked: [], locked: [] });
+  const [todayActivities, setTodayActivities] = useState<any[]>([]);
+  const [subjectData, setSubjectData] = useState<any[]>([]);
+  const [isLoadingSubjects, setIsLoadingSubjects] = useState<boolean>(true);
+  const [studyLog, setStudyLog] = useState<any>({
+    activity_type: 'REVISION',
+    activity_source: 'UNPLANNED',
+    subject: '',
+    topic: '',
+    duration_minutes: 60,
+    questions_attempted: 0,
+    questions_correct: 0,
+    confidence_rating: 5,
+    notes: ''
+  });
+  const [isSubmittingLog, setIsSubmittingLog] = useState(false);
+
+  const [dashboardStats, setDashboardStats] = useState<any>(null);
+  // National rank from the daily leaderboard (null until ranked)
+  const [nationalRank, setNationalRank] = useState<{ rank: number; total: number } | null>(null);
+  useEffect(() => {
+    fetchLeaderboard({ scope: 'national', pageSize: 1 })
+      .then((lb) => setNationalRank(lb.me ? { rank: lb.me.rank, total: lb.total } : null))
+      .catch(() => setNationalRank(null));
+  }, []);
+  // Questions due for spaced revision today (null until loaded)
+  const [revisionDue, setRevisionDue] = useState<{ due_today: number; topics: { subtopic: string; questions: number }[] } | null>(null);
+  useEffect(() => {
+    const token = localStorage.getItem('access_token');
+    guardedFetch('/api/v1/users/me/revision', { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+      .then((r) => (r.ok ? r.json() : null))
+      .then(setRevisionDue)
+      .catch(() => setRevisionDue(null));
+  }, []);
+  const [isLoadingStats, setIsLoadingStats] = useState(true);
+  const [studyHoursData, setStudyHoursData] = useState<Array<{ day: string; hours: number; date?: string; logged_minutes?: number }>>([
+    { day: 'Mon', hours: 0 },
+    { day: 'Tue', hours: 0 },
+    { day: 'Wed', hours: 0 },
+    { day: 'Thu', hours: 0 },
+    { day: 'Fri', hours: 0 },
+    { day: 'Sat', hours: 0 },
+    { day: 'Sun', hours: 0 },
+  ]);
+  const [weeklyStudyHoursSummary, setWeeklyStudyHoursSummary] = useState<{ totalHours: number; avgHours: number } | null>(null);
+  const [isLoadingStudyHours, setIsLoadingStudyHours] = useState(true);
+  const [attemptsPage, setAttemptsPage] = useState<number>(0);
+  const [guestSessionsPage, setGuestSessionsPage] = useState<number>(0);
+  const SESSIONS_PER_PAGE = 3;
+
+  const processWeeklySchedule = (schedule: any) => {
+    if (!schedule?.days || !Array.isArray(schedule.days)) return;
+    const dayMap: Record<string, string> = {
+      Monday: 'Mon',
+      Tuesday: 'Tue',
+      Wednesday: 'Wed',
+      Thursday: 'Thu',
+      Friday: 'Fri',
+      Saturday: 'Sat',
+      Sunday: 'Sun'
+    };
+    const mapped = schedule.days.map((d: any) => {
+      const shortDay = dayMap[d.day_name] || (d.day_name ? d.day_name.slice(0, 3) : 'Day');
+      const hours = Math.round(((d.logged_minutes || 0) / 60) * 10) / 10;
+      return {
+        day: shortDay,
+        hours,
+        date: d.date,
+        logged_minutes: d.logged_minutes || 0
+      };
+    });
+    setStudyHoursData(mapped);
+    const totalMinutes = schedule.days.reduce((acc: number, curr: any) => acc + (curr.logged_minutes || 0), 0);
+    const totalHours = Math.round((totalMinutes / 60) * 10) / 10;
+    setWeeklyStudyHoursSummary({
+      totalHours,
+      avgHours: Math.round((totalHours / 7) * 10) / 10
+    });
+    setIsLoadingStudyHours(false);
+  };
+
+  useEffect(() => {
+    document.title = 'Dashboard - Exam Planner';
+
+    const loadDashboard = async () => {
+      // Acquire token once — reused by all parallel requests
+      const token = localStorage.getItem('access_token');
+      const authHeaders: Record<string, string> = token ? { 'Authorization': `Bearer ${token}` } : {};
+
+      // Sync guest sessions before firing dashboard queries
+      if (token) {
+        syncGuestSessionsOnAuth(token).catch(() => {});
+        sessionStorage.removeItem('latest_synced_attempt_id');
+      }
+
+      // Fire ALL dashboard requests in parallel — no more sequential waterfall
+      const [
+        userResult,
+        statsResult,
+        subjectResult,
+        activityResult,
+        badgesResult,
+        examsResult,
+        scheduleResult,
+      ] = await Promise.allSettled([
+        fetchCurrentUser(token || undefined),
+        guardedFetch('/api/v1/attempts/student-dashboard-stats', { headers: authHeaders }).then(r => r.ok ? r.json() : null),
+        guardedFetch('/api/v1/analytics/subject-performance', { headers: authHeaders }).then(r => r.ok ? r.json() : null),
+        guardedFetch('/api/v1/analytics/activity/today', { headers: authHeaders }).then(r => r.ok ? r.json() : null),
+        token ? guardedFetch('/api/v1/study-plan/badges', { headers: authHeaders }).then(r => r.ok ? r.json() : null) : Promise.resolve(null),
+        listExams(),
+        fetchWeeklySchedule(),
+      ]);
+
+      // Apply results — each is independent so a failure in one doesn't block others
+      if (userResult.status === 'fulfilled' && userResult.value) {
+        setUser(userResult.value);
+      }
+      if (statsResult.status === 'fulfilled' && statsResult.value?.totalExams !== undefined) {
+        setDashboardStats(statsResult.value);
+      }
+      if (subjectResult.status === 'fulfilled' && Array.isArray(subjectResult.value)) {
+        setSubjectData(subjectResult.value);
+      }
+      if (activityResult.status === 'fulfilled' && Array.isArray(activityResult.value)) {
+        setTodayActivities(activityResult.value);
+      }
+      if (badgesResult.status === 'fulfilled' && badgesResult.value?.unlocked) {
+        setBadges(badgesResult.value);
+      }
+      if (examsResult.status === 'fulfilled' && Array.isArray(examsResult.value) && examsResult.value.length > 0) {
+        const published = examsResult.value.find((e: any) => e.is_active || (e.status && String(e.status).includes('PUBLISHED')));
+        setActiveExam(published || examsResult.value[0]);
+      }
+      if (scheduleResult.status === 'fulfilled' && scheduleResult.value?.days) {
+        processWeeklySchedule(scheduleResult.value);
+      }
+
+      // Done loading
+      setIsLoadingStats(false);
+      setIsLoadingSubjects(false);
+    };
+
+    loadDashboard().catch(err => {
+      console.error('Dashboard load error:', err);
+      setIsLoadingStats(false);
+      setIsLoadingSubjects(false);
+    });
+  }, []);
+
+
+
+  useRefreshUserOnFocus(fresh => setUser((prev: any) => ({ ...prev, ...fresh })));
+
+  const isFreeTier = user.subscription_tier !== 'PREMIUM';
+
+  const smartInsight = buildSmartInsight(subjectData);
+  // Chart only the subjects the student has answered; with no activity yet, show the full (empty) list
+  const answeredSubjects = subjectData.filter((s: any) => s.total_attempted > 0);
+  const chartSubjects = answeredSubjects.length > 0 ? answeredSubjects : subjectData;
+  const behaviour: DashboardBehaviour | undefined = dashboardStats?.behaviour;
+
+  const todayQuestionsAttempted = todayActivities.reduce((acc: number, curr: any) => acc + (curr.questions_attempted || 0), 0);
+  const totalQuestionsSolved = dashboardStats && dashboardStats.totalQuestionsAttempted !== undefined
+    ? dashboardStats.totalQuestionsAttempted
+    : (user?.free_questions_attempted || 0);
+
+  return (
+    <StudentLayout pageTitle="Dashboard">
+
+      {/* 1. Personalized Welcome & AI Motivation */}
+      <section style={{ marginBottom: 'clamp(24px, 4vw, 40px)', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16 }}>
+        <div style={{ flex: '1 1 280px', minWidth: 0 }}>
+          <h1 style={{ fontSize: 'clamp(22px, 3.5vw, 32px)', fontWeight: 800, color: 'var(--text-primary)', marginBottom: 8, letterSpacing: '-0.02em' }}>
+            Welcome back, {clerkUser?.firstName || user.full_name?.split(' ')[0] || 'Aspirant'}! 👋
+          </h1>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-secondary)', fontSize: 'clamp(13px, 2.5vw, 15px)', flexWrap: 'wrap' }}>
+            <div style={{ color: 'var(--accent-primary)', flexShrink: 0 }}><Ico.Brain /></div>
+            <span><strong style={{ color: 'var(--text-primary)' }}>Smart Insight:</strong> {smartInsight}</span>
+          </div>
+        </div>
+
+        <button
+          onClick={() => setShowLogModal(true)}
+          className="touch-target"
+          style={{
+            padding: '12px 20px',
+            backgroundColor: 'var(--accent-primary)',
+            color: '#fff',
+            border: 'none',
+            borderRadius: 'var(--radius)',
+            fontSize: 14,
+            fontWeight: 700,
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            boxShadow: '0 4px 12px rgba(var(--primary-red-rgb), 0.3)',
+            transition: 'transform 0.2s',
+            whiteSpace: 'nowrap',
+          }}
+          onMouseOver={(e) => e.currentTarget.style.transform = 'scale(1.02)'}
+          onMouseOut={(e) => e.currentTarget.style.transform = 'scale(1)'}
+        >
+          <Ico.Pen /> Log Today's Study
+        </button>
+      </section>
+
+      {/* Due for revision today (spaced repetition) */}
+      {revisionDue && revisionDue.due_today > 0 && (
+        <section
+          data-testid="revision-due"
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap',
+            padding: '14px 18px', marginBottom: 20, borderRadius: 'var(--radius)',
+            backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-default)',
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 800, fontSize: 15, color: 'var(--text-primary)' }}>
+              {revisionDue.due_today} {revisionDue.due_today === 1 ? 'question is' : 'questions are'} due for revision today
+            </div>
+            {revisionDue.topics.length > 0 && (
+              <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 2 }}>
+                Mostly {revisionDue.topics.slice(0, 3).map((t) => t.subtopic).join(', ')}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => navigate('/practice-exam?source=revision')}
+            style={{
+              padding: '10px 16px', borderRadius: 'var(--radius)', border: 'none', backgroundColor: 'var(--primary-red)',
+              color: '#fff', fontWeight: 700, fontSize: 14, cursor: 'pointer',
+            }}
+          >
+            Revise now
+          </button>
+        </section>
+      )}
+
+      {/* 2. Key Metrics Grid (Admin Dashboard Design Language) */}
+      <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))', gap: 18, marginBottom: 32 }}>
+        {isLoadingStats ? (
+          <>
+            {Array.from({ length: 4 }).map((_, i) => (
+              <StudentMetricCardSkeleton key={i} showProgress={i === 0} />
+            ))}
+          </>
+        ) : (
+          <>
+            <StudentMetricCard
+              title="Total Questions Solved"
+              value={
+                <span>
+                  {totalQuestionsSolved.toLocaleString()}{' '}
+                  <span style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-muted)' }}>Qs</span>
+                </span>
+              }
+              supportingText={todayQuestionsAttempted > 0 ? `${todayQuestionsAttempted} Qs attempted today` : "Across all practice exams"}
+              icon={<Ico.Target size={18} />}
+              showProgress={true}
+              progressPercent={Math.min((totalQuestionsSolved / 500) * 100, 100)}
+              accentColor="var(--primary-red)"
+              onClick={() => navigate('/analytics')}
+            />
+
+            <StudentMetricCard
+              title="Tests Completed"
+              value={
+                <span>
+                  {dashboardStats?.totalExams ?? 0}{' '}
+                  <span style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-muted)' }}>Exams</span>
+                </span>
+              }
+              supportingText="Completed practice tests"
+              icon={<Ico.Trophy size={18} />}
+              accentColor="#F2B623"
+              onClick={() => navigate('/pyq')}
+            />
+
+            <StudentMetricCard
+              title="Overall Accuracy"
+              value={
+                <span>
+                  {dashboardStats?.overallAccuracy ?? 0}%
+                </span>
+              }
+              supportingText="Average correctness score"
+              icon={<Ico.Chart size={18} />}
+              accentColor="#3A8B53"
+              onClick={() => navigate('/analytics')}
+            />
+
+            <StudentMetricCard
+              title="Total XP / Badges"
+              value={
+                <span>
+                  {(user.total_xp ?? 0).toLocaleString()}{' '}
+                  <span style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-muted)' }}>XP</span>
+                </span>
+              }
+              supportingText={
+                <span style={{ display: 'inline-flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+                {nationalRank && (
+                  <Link
+                    to="/leaderboard"
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ color: 'var(--text-primary)', fontWeight: 700, textDecoration: 'none' }}
+                  >
+                    Rank #{nationalRank.rank.toLocaleString()} of {nationalRank.total.toLocaleString()}
+                  </Link>
+                )}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowBadgesModal(true);
+                  }}
+                  style={{
+                    background: 'none', border: 'none', padding: 0, cursor: 'pointer', font: 'inherit',
+                    color: 'var(--primary-red)', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4,
+                  }}
+                >
+                  View Achievements <Ico.ArrowRight size={13} />
+                </button>
+                </span>
+              }
+              icon={<Ico.Star filled />}
+              onClick={() => navigate('/reports/monthly')}
+              accentColor="var(--primary-red)"
+            />
+          </>
+        )}
+      </section>
+
+
+      {/* 3. Performance Analytics */}
+      <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))', gap: 20, marginBottom: 32 }}>
+        {/* Subject Accuracy */}
+        <div
+          style={{
+            backgroundColor: 'var(--bg-card)',
+            padding: '22px 24px',
+            borderRadius: 'var(--radius)',
+            border: '1px solid #E2E8F0',
+            boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04), 0 1px 2px rgba(15, 23, 42, 0.02)',
+            fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif",
+          }}
+        >
+          <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+            <div>
+              <h3 style={{ fontSize: 16.5, fontWeight: 700, color: 'var(--deep-navy)', margin: '0 0 4px 0' }}>Subject Accuracy</h3>
+              <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>Your strong areas vs. areas needing improvement.</p>
+            </div>
+            {subjectData.length > 0 && subjectData.every(s => s.total_attempted === 0) && (
+              <span style={{ fontSize: 11, fontWeight: 600, padding: '3px 8px', borderRadius: 'var(--radius)', backgroundColor: 'var(--status-warning-bg)', color: 'var(--status-warning)' }}>
+                No Activity Recorded
+              </span>
+            )}
+          </div>
+          <div style={{ height: 250, width: '100%' }}>
+            {isLoadingSubjects ? (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+                Loading subject performance...
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartSubjects} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="var(--border-color)" opacity={0.6} />
+                  <XAxis dataKey="subject" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: 'var(--text-muted)' }} dy={10} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: 'var(--text-muted)' }} domain={[0, 100]} unit="%" />
+                  <Tooltip
+                    cursor={{ fill: 'var(--bg-subtle)' }}
+                    content={({ active, payload }: any) => {
+                      if (active && payload && payload.length) {
+                        const data = payload[0].payload;
+                        return (
+                          <div style={{ backgroundColor: 'var(--bg-card)', border: '1px solid #E2E8F0', padding: '10px 14px', borderRadius: 'var(--radius)', boxShadow: '0 4px 12px rgba(15,23,42,0.08)' }}>
+                            <div style={{ fontWeight: 700, fontSize: 13, color: 'var(--deep-navy)', marginBottom: 4 }}>{formatEnum(data.subject)}</div>
+                            <div style={{ fontSize: 12, color: 'var(--primary-red)', fontWeight: 600 }}>Accuracy: {data.accuracy}%</div>
+                            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                              Attempted: {data.total_attempted} | Correct: {data.total_correct}
+                            </div>
+                          </div>
+                        );
+                      }
+                      return null;
+                    }}
+                  />
+                  <Bar dataKey="accuracy" radius={[6, 6, 0, 0]} maxBarSize={38}>
+                    {chartSubjects.map((entry: any, index: number) => (
+                      <Cell
+                        key={`cell-${index}`}
+                        fill={entry.total_attempted === 0 ? 'var(--border-color)' : entry.accuracy >= 75 ? '#3A8B53' : entry.accuracy >= 60 ? 'var(--primary-red)' : '#F2B623'}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+        </div>
+
+        {/* Time Management */}
+        <div
+          style={{
+            backgroundColor: 'var(--bg-card)',
+            padding: '22px 24px',
+            borderRadius: 'var(--radius)',
+            border: '1px solid #E2E8F0',
+            boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04), 0 1px 2px rgba(15, 23, 42, 0.02)',
+            fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif",
+          }}
+        >
+          <div style={{ marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
+            <div>
+              <h3 style={{ fontSize: 16.5, fontWeight: 700, color: 'var(--deep-navy)', margin: '0 0 4px 0' }}>Time Management</h3>
+              <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
+                Study hours logged this week
+                {weeklyStudyHoursSummary !== null ? ` • ${weeklyStudyHoursSummary.totalHours} hrs total` : ''}
+              </p>
+            </div>
+            <button
+              onClick={() => setShowLogModal(true)}
+              className="touch-target"
+              style={{
+                background: '#FEF2F2',
+                border: '1px solid #FECACA',
+                borderRadius: 4,
+                padding: '5px 12px',
+                fontSize: 12,
+                fontWeight: 700,
+                color: 'var(--primary-red)',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+                transition: 'all 0.15s ease'
+              }}
+              title="Log a study session"
+            >
+              + Log Time
+            </button>
+          </div>
+          <div style={{ height: 250, width: '100%' }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={studyHoursData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="colorHours" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="var(--primary-red)" stopOpacity={0.25} />
+                    <stop offset="95%" stopColor="var(--primary-red)" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="var(--border-color)" opacity={0.6} />
+                <XAxis dataKey="day" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: 'var(--text-muted)' }} dy={10} />
+                <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: 'var(--text-muted)' }} unit="h" />
+                <Tooltip
+                  cursor={{ stroke: 'var(--border-color)', strokeWidth: 1, strokeDasharray: '4 4' }}
+                  formatter={(value: any) => [`${value} hrs`, 'Study Time']}
+                  labelFormatter={(label: any) => `${label}`}
+                  contentStyle={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-color)', borderRadius: 4, boxShadow: '0 4px 12px rgba(15,23,42,0.08)', color: 'var(--deep-navy)' }}
+                />
+                <Area type="monotone" dataKey="hours" stroke="var(--primary-red)" strokeWidth={2.5} fillOpacity={1} fill="url(#colorHours)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      </section>
+
+
+      {/* 4. Deep AI Insights & Call to Action */}
+      <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 340px), 1fr))', gap: 24, marginBottom: 32 }}>
+
+        {/* The Psychometric Layer */}
+        <div style={{
+          backgroundColor: 'var(--bg-card)', padding: 'clamp(20px, 4vw, 32px)', borderRadius: 'var(--radius)',
+          border: '1px solid var(--border-default)', boxShadow: 'var(--shadow-color-base)',
+          position: 'relative', overflow: 'hidden'
+        }}>
+          {/* Blur Overlay for Free Tier */}
+          {isFreeTier && (
+            <div style={{
+              position: 'absolute', inset: 0, zIndex: 10,
+              backdropFilter: 'blur(8px)', backgroundColor: 'rgba(255,255,255,0.1)',
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+              padding: 20,
+            }}>
+              <div style={{ padding: 16, backgroundColor: 'var(--bg-card)', borderRadius: 'var(--radius)', boxShadow: 'var(--shadow-color-base)', marginBottom: 16 }}>
+                <Ico.Shield />
+              </div>
+              <h3 style={{ fontSize: 'clamp(18px, 3.5vw, 20px)', fontWeight: 800, color: 'var(--text-primary)', margin: '0 0 8px 0', textAlign: 'center' }}>Premium Analytics Locked</h3>
+              <p style={{ fontSize: 14, color: 'var(--text-secondary)', marginBottom: 24, textAlign: 'center', maxWidth: 280 }}>
+                Unlock deep behavioral tracking and psychometric insights with the Pro Plan.
+              </p>
+              <Link to="/billing" className="touch-target" style={{
+                padding: '12px 24px', backgroundColor: 'var(--accent-primary)', color: '#FFF',
+                borderRadius: 'var(--radius)', fontSize: 14, fontWeight: 700, textDecoration: 'none',
+                boxShadow: '0 8px 16px var(--shadow-color-accent)'
+              }}>
+                Upgrade to Pro
+              </Link>
+            </div>
+          )}
+
+          <div style={{ opacity: isFreeTier ? 0.6 : 1, filter: isFreeTier ? 'blur(3px)' : 'none', transition: 'all 0.3s' }}>
+            {/* Subtle ambient glow for AI section */}
+            <div style={{ position: 'absolute', top: -50, right: -50, width: 200, height: 200, background: 'radial-gradient(circle, var(--accent-bg) 0%, transparent 70%)', opacity: 0.7, pointerEvents: 'none' }} />
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 24 }}>
+              <div style={{ padding: 8, backgroundColor: 'var(--pink-bg)', color: 'var(--pink-primary)', borderRadius: 'var(--radius)' }}>
+                <Ico.Brain />
+              </div>
+              <div>
+                <h3 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>Deep Behavioral Insights</h3>
+                <p style={{ fontSize: 14, color: 'var(--text-secondary)', margin: '4px 0 0 0' }}>Behavioral & Psychometric Analysis</p>
+              </div>
+            </div>
+
+            {!behaviour || behaviour.answered === 0 ? (
+              <p style={{ fontSize: 14, color: 'var(--text-muted)', margin: 0 }}>
+                Answer a few questions in a practice test to see how you answer: first-try accuracy, near misses,
+                revisits, answer changes and pace.
+              </p>
+            ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 'clamp(16px, 3vw, 32px)' }}>
+              {/* Decision Accuracy */}
+              <div>
+                <h4 style={{ fontSize: 13, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-disabled)', fontWeight: 700, marginBottom: 16 }}>Decision Accuracy</h4>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  <div style={{ padding: 16, backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', border: '1px solid var(--border-default)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                      <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>Correct First Time</span>
+                      <span style={{ fontSize: 16, fontWeight: 800, color: 'var(--success-primary)' }}>{behaviour.first_try_correct_pct}%</span>
+                    </div>
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>Right answer without changing it.</p>
+                  </div>
+                  <div style={{ padding: 16, backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', border: '1px solid var(--border-default)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                      <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>Near Misses</span>
+                      <span style={{ fontSize: 16, fontWeight: 800, color: 'var(--warning-primary)' }}>{behaviour.near_miss_pct}%</span>
+                    </div>
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>Wrong, but picked the option closest to correct.</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Behavior Analysis */}
+              <div>
+                <h4 style={{ fontSize: 13, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-disabled)', fontWeight: 700, marginBottom: 16 }}>Behavior Analysis</h4>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+                  <BehaviourBar
+                    label="Question Revisits"
+                    {...rateLevel(behaviour.revisits_per_10, 2, 5)}
+                    value={`${behaviour.revisits_per_10} per 10 Qs`}
+                    fill={Math.min(behaviour.revisits_per_10 / 10, 1)}
+                  />
+                  <BehaviourBar
+                    label="Answer Changes"
+                    {...rateLevel(behaviour.answer_changes_per_10, 1, 3)}
+                    value={`${behaviour.answer_changes_per_10} per 10 Qs`}
+                    fill={Math.min(behaviour.answer_changes_per_10 / 5, 1)}
+                  />
+                  <BehaviourBar
+                    label="Avg Time / Question"
+                    level=""
+                    color="var(--accent-primary)"
+                    value={formatSeconds(behaviour.avg_seconds_per_question)}
+                    fill={Math.min(behaviour.avg_seconds_per_question / 120, 1)}
+                  />
+                </div>
+              </div>
+            </div>
+            )}
+          </div>
+        </div>
+
+        {/* 5. Call to Action / Next Up */}
+        <div style={{
+          backgroundColor: 'var(--accent-primary)', padding: 'clamp(20px, 4vw, 32px)', borderRadius: 'var(--radius)',
+          color: 'var(--bg-card)', display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
+          boxShadow: '0 20px 40px var(--shadow-color-accent)',
+          backgroundImage: 'linear-gradient(135deg, var(--accent-primary) 0%, var(--accent-darker) 100%)',
+          position: 'relative', overflow: 'hidden', minWidth: 0
+        }}>
+          <div style={{ position: 'absolute', top: -30, right: -30, opacity: 0.1 }}>
+            <Ico.Target />
+          </div>
+
+          <div style={{ marginBottom: 20, position: 'relative', zIndex: 1 }}>
+            <div style={{ display: 'inline-block', padding: '6px 12px', backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 'var(--radius)', fontSize: 12, fontWeight: 700, letterSpacing: '0.05em', textTransform: 'uppercase', marginBottom: 16 }}>
+              Up Next
+            </div>
+            <h3 style={{ fontSize: 'clamp(18px, 3vw, 22px)', fontWeight: 800, margin: '0 0 12px 0', lineHeight: 1.3 }}>
+              {activeExam ? `Practice ${activeExam.name}` : 'Resume UPSC CSE Practice'}
+            </h3>
+            <p style={{ fontSize: 14, opacity: 0.9, margin: 0, lineHeight: 1.5 }}>
+              Ready to test your concept retention? Start an active UPSC Prelims exam session now.
+            </p>
+          </div>
+
+          <button
+            onClick={() => window.location.href = activeExam ? `/exam/${activeExam.code}` : '/pyq'}
+            className="touch-target"
+            style={{
+              width: '100%', padding: '14px', borderRadius: 'var(--radius)', border: 'none',
+              backgroundColor: 'var(--bg-card)', color: 'var(--accent-darker)',
+              fontSize: 14, fontWeight: 700, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              marginTop: 16, transition: 'transform 0.2s', position: 'relative', zIndex: 1,
+              whiteSpace: 'nowrap'
+            }}
+            onMouseOver={(e) => e.currentTarget.style.transform = 'scale(1.02)'}
+            onMouseOut={(e) => e.currentTarget.style.transform = 'scale(1)'}
+          >
+            <span>Start Practice Exam</span>
+            <Ico.ArrowRight size={16} />
+          </button>
+        </div>
+      </section>
+
+
+      {/* 4. Today's Study Feed */}
+      <section style={{ marginBottom: 40 }}>
+        <div style={{ backgroundColor: 'var(--bg-card)', padding: 24, borderRadius: 'var(--radius)', border: '1px solid var(--border-default)', boxShadow: 'var(--shadow-color-base)' }}>
+          <div style={{ marginBottom: 24, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <h3 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)', margin: '0 0 4px 0' }}>Today's Study Log</h3>
+              <p style={{ fontSize: 14, color: 'var(--text-secondary)', margin: 0 }}>
+                {todayActivities.length === 0 ? 'No activities logged today.' : `${todayActivities.length} activities logged`}
+              </p>
+            </div>
+            <div style={{ padding: '8px 16px', backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', border: '1px solid var(--border-default)' }}>
+              <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+                Total: {Math.floor(todayActivities.reduce((acc, curr) => acc + curr.duration_minutes, 0) / 60)}h{' '}
+                {todayActivities.reduce((acc, curr) => acc + curr.duration_minutes, 0) % 60}m
+              </span>
+            </div>
+          </div>
+          <div style={{ overflowY: 'auto', maxHeight: 300, display: 'flex', flexDirection: 'column', gap: 12, paddingRight: 4 }}>
+            {todayActivities.length === 0 ? (
+              <div style={{ padding: 40, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)' }}>
+                <Ico.Book size={40} />
+                <p style={{ fontSize: 15, marginTop: 16 }}>Ready to start studying? Log your first activity today!</p>
+              </div>
+            ) : (
+              todayActivities.map((activity, idx) => (
+                <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 16, padding: 16, backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', border: '1px solid var(--border-default)' }}>
+                  <div style={{
+                    width: 44, height: 44, borderRadius: 'var(--radius)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    backgroundColor: activity.activity_type === 'MOCK_TEST' ? 'rgba(234, 179, 8, 0.1)' :
+                      activity.activity_type === 'PYQ' ? 'rgba(168, 85, 247, 0.1)' :
+                        activity.activity_type === 'REVISION' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(var(--primary-red-rgb), 0.1)',
+                    color: activity.activity_type === 'MOCK_TEST' ? '#EAB308' :
+                      activity.activity_type === 'PYQ' ? '#A855F7' :
+                        activity.activity_type === 'REVISION' ? '#22C55E' : 'var(--primary-red)'
+                  }}>
+                    {activity.activity_type === 'MOCK_TEST' || activity.activity_type === 'PYQ' ? <Ico.Trophy size={20} /> :
+                      activity.activity_type === 'REVISION' ? <Ico.Refresh /> : <Ico.Book size={20} />}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 2 }}>
+                      {activity.subject || activity.activity_type.replace('_', ' ')}
+                    </div>
+                    <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                      {activity.topic || 'General Practice'} • {activity.activity_source}
+                    </div>
+                    {(activity.activity_type === 'MOCK_TEST' || activity.activity_type === 'PYQ') && activity.questions_attempted > 0 && (
+                      <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Accuracy: {Math.round((activity.questions_correct / activity.questions_attempted) * 100)}%</div>
+                    )}
+                    {activity.activity_type === 'REVISION' && activity.confidence_rating && (
+                      <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Confidence: {activity.confidence_rating}/10</div>
+                    )}
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 2 }}>
+                      {Math.floor(activity.duration_minutes / 60) > 0 && `${Math.floor(activity.duration_minutes / 60)}h `}{activity.duration_minutes % 60}m
+                    </div>
+                    <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+                      {new Date(activity.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* 5. Exam Attempts History & Synced Guest Sessions Feed - Symmetrical Cards */}
+      <section style={{ marginBottom: 40 }}>
+        {(() => {
+          const registeredAttempts = dashboardStats?.recentAttempts?.filter((a: any) => !a.isGuestSynced) || [];
+          const syncedGuestAttempts = dashboardStats?.recentAttempts?.filter((a: any) => a.isGuestSynced) || [];
+          
+          const attemptsTotalPages = Math.max(1, Math.ceil(registeredAttempts.length / SESSIONS_PER_PAGE));
+          const visibleRegisteredAttempts = registeredAttempts.slice(attemptsPage * SESSIONS_PER_PAGE, (attemptsPage + 1) * SESSIONS_PER_PAGE);
+
+          const guestTotalPages = Math.max(1, Math.ceil(syncedGuestAttempts.length / SESSIONS_PER_PAGE));
+          const visibleSyncedGuestAttempts = syncedGuestAttempts.slice(guestSessionsPage * SESSIONS_PER_PAGE, (guestSessionsPage + 1) * SESSIONS_PER_PAGE);
+
+          return (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 340px), 1fr))', gap: 24 }}>
+              
+              {/* Card 1: Recent Exam Attempts */}
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                padding: 24,
+                borderRadius: 'var(--radius)',
+                border: '1px solid var(--border-default)',
+                boxShadow: 'var(--shadow-color-base)',
+                display: 'flex',
+                flexDirection: 'column',
+                justifyContent: 'space-between',
+                height: 420,
+                boxSizing: 'border-box'
+              }}>
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                    <div>
+                      <h3 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)', margin: '0 0 2px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <Trophy size={18} color="var(--primary-red)" /> Recent Exam Attempts
+                      </h3>
+                      <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: 0 }}>Registered exam history</p>
+                    </div>
+                    <span style={{ fontSize: 11, fontWeight: 800, padding: '4px 10px', borderRadius: 'var(--radius)', backgroundColor: 'var(--bg-subtle)', color: 'var(--primary-red)', border: '1px solid #BFDBFE' }}>
+                      {registeredAttempts.length} Recorded
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {visibleRegisteredAttempts.length === 0 ? (
+                      <div style={{ padding: '36px 16px', textAlign: 'center', backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', color: 'var(--text-muted)' }}>
+                        <Trophy size={28} />
+                        <p style={{ fontSize: 13, marginTop: 8, margin: 0 }}>No main exam attempts recorded yet.</p>
+                      </div>
+                    ) : (
+                      visibleRegisteredAttempts.map((attempt: any) => (
+                        <div
+                          key={attempt.id}
+                          onClick={() => navigate(`/analytics?attemptId=${attempt.id}`)}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '10px 14px',
+                            backgroundColor: 'var(--bg-subtle)',
+                            borderRadius: 'var(--radius)',
+                            border: '1px solid var(--border-default)',
+                            gap: 12,
+                            cursor: 'pointer',
+                            transition: 'all 0.15s ease'
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.borderColor = 'var(--accent-border)';
+                            e.currentTarget.style.backgroundColor = 'var(--bg-subtle)';
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.borderColor = 'var(--border-default)';
+                            e.currentTarget.style.backgroundColor = 'var(--bg-subtle)';
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <div style={{
+                              width: 36, height: 36, borderRadius: 'var(--radius)',
+                              backgroundColor: '#ECFDF5', border: '1px solid #A7F3D0', color: '#3A8B53',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              fontWeight: 800, fontSize: 14
+                            }}>
+                              P
+                            </div>
+                            <div>
+                              <div style={{ fontSize: 13.5, fontWeight: 700, color: 'var(--text-primary)' }}>
+                                {attempt.topicName}
+                              </div>
+                              <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                                {attempt.targetExam} • {new Date(attempt.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div style={{ textAlign: 'right', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+                            <div style={{ fontSize: 14, fontWeight: 800, color: 'var(--text-primary)' }}>
+                              Score: {attempt.score} / {attempt.totalMarksPossible}
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <StatusBadge
+                                status={attempt.accuracy >= 70 ? 'high-accuracy' : attempt.accuracy >= 40 ? 'moderate-accuracy' : 'low-accuracy'}
+                                label={`${attempt.accuracy}% Acc`}
+                                size="sm"
+                              />
+                              <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-primary)', textDecoration: 'underline' }}>
+                                View Report →
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* Pagination Footer */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: 12, borderTop: '1px solid var(--border-default)' }}>
+                  <span style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 500 }}>
+                    Page {attemptsPage + 1} of {attemptsTotalPages}
+                  </span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      onClick={() => setAttemptsPage(p => Math.max(0, p - 1))}
+                      disabled={attemptsPage === 0}
+                      style={{
+                        padding: '5px 9px', borderRadius: 'var(--radius)', border: '1px solid var(--border-default)',
+                        backgroundColor: attemptsPage === 0 ? 'var(--bg-subtle)' : 'var(--bg-card)',
+                        color: attemptsPage === 0 ? 'var(--text-disabled)' : 'var(--text-primary)',
+                        cursor: attemptsPage === 0 ? 'not-allowed' : 'pointer',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center'
+                      }}
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <button
+                      onClick={() => setAttemptsPage(p => Math.min(attemptsTotalPages - 1, p + 1))}
+                      disabled={attemptsPage >= attemptsTotalPages - 1}
+                      style={{
+                        padding: '5px 9px', borderRadius: 'var(--radius)', border: '1px solid var(--border-default)',
+                        backgroundColor: attemptsPage >= attemptsTotalPages - 1 ? 'var(--bg-subtle)' : 'var(--bg-card)',
+                        color: attemptsPage >= attemptsTotalPages - 1 ? 'var(--text-disabled)' : 'var(--text-primary)',
+                        cursor: attemptsPage >= attemptsTotalPages - 1 ? 'not-allowed' : 'pointer',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center'
+                      }}
+                    >
+                      <ChevronRight size={14} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Card 2: Synced Guest Sessions */}
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                padding: 24,
+                borderRadius: 'var(--radius)',
+                border: '1px solid var(--border-default)',
+                boxShadow: 'var(--shadow-color-base)',
+                display: 'flex',
+                flexDirection: 'column',
+                justifyContent: 'space-between',
+                height: 420,
+                boxSizing: 'border-box'
+              }}>
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                    <div>
+                      <h3 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)', margin: '0 0 2px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <RefreshCw size={18} color="#3A8B53" /> Synced Guest Sessions
+                      </h3>
+                      <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: 0 }}>Auto-synced guest tests</p>
+                    </div>
+                    <span style={{ fontSize: 11, fontWeight: 800, padding: '4px 10px', borderRadius: 'var(--radius)', backgroundColor: '#ECFDF5', color: '#3A8B53', border: '1px solid #A7F3D0' }}>
+                      {syncedGuestAttempts.length} Synced
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {visibleSyncedGuestAttempts.length === 0 ? (
+                      <div style={{ padding: '36px 16px', textAlign: 'center', backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', color: 'var(--text-muted)' }}>
+                        <RefreshCw size={28} />
+                        <p style={{ fontSize: 13, marginTop: 8, margin: 0 }}>No guest sessions synced yet.</p>
+                      </div>
+                    ) : (
+                      visibleSyncedGuestAttempts.map((attempt: any) => (
+                        <div
+                          key={attempt.id}
+                          onClick={() => navigate(`/analytics?attemptId=${attempt.id}`)}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '10px 14px',
+                            backgroundColor: 'var(--bg-subtle)',
+                            borderRadius: 'var(--radius)',
+                            border: '1px solid var(--border-default)',
+                            gap: 12,
+                            cursor: 'pointer',
+                            transition: 'all 0.15s ease'
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.borderColor = '#A7F3D0';
+                            e.currentTarget.style.backgroundColor = '#F0FDF4';
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.borderColor = 'var(--border-default)';
+                            e.currentTarget.style.backgroundColor = 'var(--bg-subtle)';
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <div style={{
+                              width: 36, height: 36, borderRadius: 'var(--radius)',
+                              backgroundColor: 'var(--bg-subtle)', border: '1px solid #BFDBFE', color: 'var(--primary-red)',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              fontWeight: 800, fontSize: 14
+                            }}>
+                              G
+                            </div>
+                            <div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                <span style={{ fontSize: 13.5, fontWeight: 700, color: 'var(--text-primary)' }}>
+                                  {attempt.topicName}
+                                </span>
+                                <span style={{ fontSize: 10, fontWeight: 800, padding: '1px 6px', borderRadius: 'var(--radius)', backgroundColor: 'var(--bg-subtle)', color: 'var(--primary-red)', border: '1px solid #BFDBFE' }}>
+                                  SYNCED
+                                </span>
+                              </div>
+                              <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                                {attempt.targetExam} • {new Date(attempt.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div style={{ textAlign: 'right', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+                            <div style={{ fontSize: 14, fontWeight: 800, color: 'var(--text-primary)' }}>
+                              Score: {attempt.score} / {attempt.totalMarksPossible}
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <div style={{ fontSize: 11, color: attempt.accuracy >= 70 ? '#3A8B53' : '#F2B623', fontWeight: 700 }}>
+                                {attempt.accuracy}% Acc
+                              </div>
+                              <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-primary)', textDecoration: 'underline' }}>
+                                View Report →
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* Pagination Footer */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: 12, borderTop: '1px solid var(--border-default)' }}>
+                  <span style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 500 }}>
+                    Page {guestSessionsPage + 1} of {guestTotalPages}
+                  </span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      onClick={() => setGuestSessionsPage(p => Math.max(0, p - 1))}
+                      disabled={guestSessionsPage === 0}
+                      style={{
+                        padding: '5px 9px', borderRadius: 'var(--radius)', border: '1px solid var(--border-default)',
+                        backgroundColor: guestSessionsPage === 0 ? 'var(--bg-subtle)' : 'var(--bg-card)',
+                        color: guestSessionsPage === 0 ? 'var(--text-disabled)' : 'var(--text-primary)',
+                        cursor: guestSessionsPage === 0 ? 'not-allowed' : 'pointer',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center'
+                      }}
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <button
+                      onClick={() => setGuestSessionsPage(p => Math.min(guestTotalPages - 1, p + 1))}
+                      disabled={guestSessionsPage >= guestTotalPages - 1}
+                      style={{
+                        padding: '5px 9px', borderRadius: 'var(--radius)', border: '1px solid var(--border-default)',
+                        backgroundColor: guestSessionsPage >= guestTotalPages - 1 ? 'var(--bg-subtle)' : 'var(--bg-card)',
+                        color: guestSessionsPage >= guestTotalPages - 1 ? 'var(--text-disabled)' : 'var(--text-primary)',
+                        cursor: guestSessionsPage >= guestTotalPages - 1 ? 'not-allowed' : 'pointer',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center'
+                      }}
+                    >
+                      <ChevronRight size={14} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          );
+        })()}
+      </section>
+
+      {/* Badges Modal */}
+      {showBadgesModal && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center'
+        }} onClick={() => setShowBadgesModal(false)}>
+          <div style={{
+            backgroundColor: 'var(--bg-card)', width: '100%', maxWidth: 480,
+            borderRadius: 'var(--radius)', padding: 32, boxShadow: '0 24px 48px rgba(0,0,0,0.2)',
+            border: '1px solid var(--border-default)'
+          }} onClick={e => e.stopPropagation()}>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+              <h2 style={{ fontSize: 24, fontWeight: 800, margin: 0, color: 'var(--text-primary)' }}>Your Achievements</h2>
+              <button onClick={() => setShowBadgesModal(false)} style={{ background: 'none', border: 'none', fontSize: 24, cursor: 'pointer', color: 'var(--text-secondary)' }}>&times;</button>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 16 }}>
+              {/* Earned Badges */}
+              {badges?.unlocked?.map((badge: any) => (
+                <div key={badge.id} style={{ display: 'flex', alignItems: 'center', gap: 16, padding: 16, backgroundColor: 'var(--success-bg, rgba(16, 185, 129, 0.1))', borderRadius: 'var(--radius)', border: '1px solid var(--success-primary)' }}>
+                  <div style={{ fontSize: 32 }}>{badge.icon_url || (badge.milestone ? '🏅' : '')}</div>
+                  <div>
+                    <div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{badge.name}</div>
+                    <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{badge.description}</div>
+                  </div>
+                </div>
+              ))}
+
+              {/* Locked Badges */}
+              {badges?.locked?.map((badge: any) => (
+                <div key={badge.id} style={{ display: 'flex', alignItems: 'center', gap: 16, padding: 16, backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', border: '1px dashed var(--border-disabled)', opacity: badge.milestone ? 0.9 : 0.6 }}>
+                  <div style={{ fontSize: 32, filter: 'grayscale(1)' }}>{badge.icon_url || (badge.milestone ? '🏅' : '')}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>
+                      {badge.name}
+                      {badge.required_xp && <span style={{ fontSize: 11, backgroundColor: 'var(--bg-card)', padding: '2px 6px', borderRadius: 'var(--radius)', marginLeft: 8 }}>Requires {badge.required_xp} XP</span>}
+                    </div>
+                    <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{badge.description}</div>
+                    {/* Milestones show how close the student is */}
+                    {badge.milestone && (
+                      <div style={{ marginTop: 6 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>
+                          <span>{badge.milestone.criteria_label}: {badge.milestone.progress.toLocaleString()} / {badge.milestone.threshold.toLocaleString()}</span>
+                          {badge.milestone.xp_reward > 0 && <span>+{badge.milestone.xp_reward} XP</span>}
+                        </div>
+                        <div style={{ height: 6, backgroundColor: 'var(--bg-card)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
+                          <div style={{ width: `${Math.min((badge.milestone.progress / Math.max(badge.milestone.threshold, 1)) * 100, 100)}%`, height: '100%', backgroundColor: 'var(--accent-primary)' }} />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ marginTop: 24, textAlign: 'center' }}>
+              <div style={{ fontSize: 14, color: 'var(--text-secondary)', marginBottom: 8 }}>Keep hitting your daily goals to unlock more!</div>
+              <div style={{ width: '100%', height: 8, backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
+                <div style={{ width: `${Math.min(((user.total_xp ?? 0) / 2500) * 100, 100)}%`, height: '100%', backgroundColor: 'var(--accent-primary)', borderRadius: 'var(--radius)' }} />
+              </div>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* Unified Log Study Modal */}
+      <LogStudyModal
+        isOpen={showLogModal}
+        onClose={() => setShowLogModal(false)}
+        onSuccess={async () => {
+          // Reload activity + stats in parallel after logging study
+          const token = localStorage.getItem('access_token');
+          const authHeaders: Record<string, string> = token ? { 'Authorization': `Bearer ${token}` } : {};
+          const [actRes, statsRes, subjRes, schRes] = await Promise.allSettled([
+            guardedFetch('/api/v1/analytics/activity/today', { headers: authHeaders }).then(r => r.ok ? r.json() : null),
+            guardedFetch('/api/v1/attempts/student-dashboard-stats', { headers: authHeaders }).then(r => r.ok ? r.json() : null),
+            guardedFetch('/api/v1/analytics/subject-performance', { headers: authHeaders }).then(r => r.ok ? r.json() : null),
+            fetchWeeklySchedule(),
+          ]);
+          if (actRes.status === 'fulfilled' && Array.isArray(actRes.value)) setTodayActivities(actRes.value);
+          if (statsRes.status === 'fulfilled' && statsRes.value?.totalExams !== undefined) setDashboardStats(statsRes.value);
+          if (subjRes.status === 'fulfilled' && Array.isArray(subjRes.value)) setSubjectData(subjRes.value);
+          if (schRes.status === 'fulfilled' && schRes.value?.days) processWeeklySchedule(schRes.value);
+        }}
+      />
+    </StudentLayout>
+  );
+}
+
+interface DashboardBehaviour {
+  answered: number;
+  first_try_correct_pct: number;
+  near_miss_pct: number;
+  revisits_per_10: number;
+  answer_changes_per_10: number;
+  avg_seconds_per_question: number;
+}
+
+/** One-line insight from the student's real subject accuracy (subjects with at least 5 answers count). */
+function buildSmartInsight(subjects: Array<{ subject: string; accuracy: number; total_attempted: number }>): string {
+  const answered = subjects.filter((s) => s.total_attempted > 0);
+  const solid = answered.filter((s) => s.total_attempted >= 5);
+  const pool = solid.length > 0 ? solid : answered;
+  if (pool.length === 0) return 'Take a practice test to unlock insights about your strong and weak subjects.';
+  if (pool.length === 1) {
+    const only = pool[0];
+    return `${only.accuracy}% accuracy in ${only.subject} so far. Try another subject to compare.`;
+  }
+  const sorted = [...pool].sort((a, b) => b.accuracy - a.accuracy);
+  const best = sorted[0];
+  const worst = sorted[sorted.length - 1];
+  return `Your strongest subject is ${best.subject} (${best.accuracy}%). Focus on ${worst.subject} (${worst.accuracy}%) next.`;
+}
+
+/** Low / Moderate / High for a per-10-questions rate, with a matching colour. */
+function rateLevel(rate: number, moderateAt: number, highAt: number): { level: string; color: string } {
+  if (rate >= highAt) return { level: 'High', color: 'var(--primary-red)' };
+  if (rate >= moderateAt) return { level: 'Moderate', color: 'var(--warning-primary)' };
+  return { level: 'Low', color: 'var(--success-primary)' };
+}
+
+function formatSeconds(totalSeconds: number): string {
+  const secs = Math.round(totalSeconds);
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+}
+
+function BehaviourBar({ label, level, value, color, fill }: { label: string; level: string; value: string; color: string; fill: number }) {
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, gap: 8 }}>
+        <span style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-secondary)' }}>{label}</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color, textAlign: 'right' }}>
+          {level ? `${level} (${value})` : value}
+        </span>
+      </div>
+      <div style={{ height: 6, width: '100%', backgroundColor: 'var(--bg-subtle)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
+        <div style={{ width: `${Math.max(fill, 0.03) * 100}%`, height: '100%', backgroundColor: color, borderRadius: 'var(--radius)' }} />
+      </div>
+    </div>
+  );
+}

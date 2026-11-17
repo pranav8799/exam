@@ -1,0 +1,805 @@
+import os
+import re
+import logging
+from typing import Optional, List, Union
+from fastapi import APIRouter, UploadFile, File, Form, Depends, BackgroundTasks, Query
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
+from sqlmodel import select, col, case
+from sqlmodel.ext.asyncio.session import AsyncSession
+from app.db.session import get_async_session
+from app.db.models import Exam, LanguageCode, QuestionStatus
+from app.db.models.user import User, UserRole
+from app.core.languages import parse_language
+from app.core.deps import (
+    require_roles,
+    require_admin_section,
+    require_admin_section_or_permission,
+    can_see_unpublished,
+    require_exam_question_visible,
+)
+from app.schemas.question import ExamReviewQuestionsResponse
+from app.schemas.syllabus import CompleteSyllabusResponse
+from app.schemas.question_integrity import ExamIntegrityQuestionsResponse
+from app.schemas.exam_year import ExamsByYearResponse
+from app.services.exam_service import ExamService
+from app.services.exam_export_service import ExamExportService
+from app.services.question_service import QuestionService
+from app.services.syllabus_service import SyllabusService
+from app.pipeline.patterns import extract_option_analysis_from_text, clean_correct_option_text
+
+
+
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/exams", tags=["Exams & Document Ingestion"])
+
+# Whole-exam answer dumps and integrity diagnostics are QA tools: staff only, so the answer bank
+# can't be scraped in one request. Students get solutions per question (/questions/{id}/solution).
+view_exam_review = require_admin_section_or_permission("admin.review", "questions.review")
+
+
+def _remove_temp_file(path_str: str):
+    """Background cleanup task to delete temporary ZIP file after download."""
+    try:
+        if os.path.exists(path_str):
+            os.remove(path_str)
+    except Exception:
+        pass
+
+
+@router.post("/upload")
+async def upload_exam_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(
+        ...,
+        description="Uploaded Question Paper PDF file.",
+    ),
+    year: Optional[str] = Form(default=None, description="Exam year e.g. '2024'"),
+    set_code: Optional[str] = Form(default=None, description="Paper set code e.g. 'SET_A'"),
+    exam_name: Optional[str] = Form(default=None, description="Exam name e.g. 'UPSC'"),
+    stage: Optional[str] = Form(default=None, description="Stage e.g. 'PRELIMS'"),
+    subject_code: Optional[str] = Form(default=None, description="Subject e.g. 'GS1'"),
+    exam_type: Optional[str] = Form(default=None, description="Exam type code e.g. 'upsc', 'mpsc'"),
+    exam_type_id: Optional[int] = Form(default=None, description="Exam type ID foreign key"),
+    run_mode: Optional[str] = Form(default="auto", description="'celery', 'background', or 'auto'"),
+    conflict_resolution: Optional[str] = Form(default="CHECK", description="'CHECK', 'OVERWRITE', or 'SKIP'"),
+    paper_mode: Optional[str] = Form(
+        default="EXAM_WISE",
+        description="'EXAM_WISE' (one exam and year; the fields above apply) or 'MIXED' (question bank whose "
+        "questions carry their own '[MPSC Mains 2017]' source; exam, year and set are not used)",
+    ),
+    marks_per_question: Optional[float] = Form(default=None, description="Marks for a correct answer, e.g. 2"),
+    negative_marks_per_question: Optional[float] = Form(
+        default=None, description="Marks deducted for a wrong answer, e.g. 0.67 (0 = no negative marking)"
+    ),
+    session: AsyncSession = Depends(get_async_session),
+    _admin: User = Depends(require_admin_section("admin.upload")),
+):
+    """
+    Uploads a Question Paper PDF and initiates Pipeline 1.
+    Extracts canonical exam code, year, stage, subject, and set dynamically from uploaded file and form parameters.
+    """
+    service = ExamService(session)
+    return await service.handle_pdf_upload(
+        file=file,
+        year=year,
+        set_code=set_code,
+        exam_name=exam_name,
+        stage=stage,
+        subject_code=subject_code,
+        exam_type=exam_type,
+        exam_type_id=exam_type_id,
+        run_mode=run_mode,
+        conflict_resolution=conflict_resolution,
+        background_tasks=background_tasks,
+        paper_mode=paper_mode,
+        marks_per_question=marks_per_question,
+        negative_marks_per_question=negative_marks_per_question,
+    )
+
+
+EXAM_RELATIONSHIP_FIELDS = {
+    "syllabus_versions",
+    "questions",
+    "attempts",
+    "pipeline_runs",
+    "passages",
+    "answer_key_batches",
+    "review_tasks",
+    "exam_type_entity",
+}
+
+
+@router.get("")
+async def list_exams(
+    status: Optional[str] = Query(default=None, description="Filter by Exam status (e.g. 'PUBLISHED')"),
+    is_active: Optional[bool] = Query(default=None, description="Filter by active status for candidates"),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Lists all registered competitive exams, optionally filtered by status and is_active."""
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = build_cache_key("exams:list", status=status, is_active=is_active)
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return JSONResponse(content=cached_data)
+
+    service = ExamService(session)
+    exams = await service.list_exams(status=status, is_active=is_active)
+    if exams is not None:
+        serialized = jsonable_encoder(exams, exclude=EXAM_RELATIONSHIP_FIELDS)
+        await cache.set(cache_key, serialized, ttl_seconds=1800)
+        return JSONResponse(content=serialized)
+    return JSONResponse(content=[])
+
+
+@router.get(
+    "/{exam_id}/review-questions",
+    response_model=ExamReviewQuestionsResponse,
+    summary="Get All Exam Questions with Complete Solutions for Verification & Review",
+)
+@router.get(
+    "/{exam_id}/solutions",
+    response_model=ExamReviewQuestionsResponse,
+    summary="Get All Exam Questions with Complete Solutions (Alias)",
+)
+async def get_exam_questions_for_review(
+    exam_id: int | str,
+    language: str = Query(default="en", description="Target Language"),
+    status: Optional[QuestionStatus] = Query(default=None, description="Filter by Question status e.g. PENDING_HUMAN_REVIEW or PUBLISHED"),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    limit: int = Query(default=10, ge=1, le=100, description="Items per page"),
+    target_question_number: Optional[int] = Query(default=None, description="Jump to specific question number in paper"),
+    target_question_id: Optional[Union[str, int]] = Query(default=None, description="Jump to specific question ID"),
+    session: AsyncSession = Depends(get_async_session),
+    viewer: User = Depends(view_exam_review),
+):
+    """
+    Staff only. Reviewers with only the questions.review permission still see every status.
+
+    Dedicated endpoint for user/admin review per question in an exam.
+    Returns complete questions alongside full step-by-step solutions,
+    core concepts, option distractor analyses (option explanations),
+    key takeaways, and points to remember/common traps, with real-time review progress counters.
+    """
+    from fastapi import HTTPException
+    try:
+        eid_int = int(exam_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    if not can_see_unpublished(viewer):
+        status = QuestionStatus.PUBLISHED
+
+    lang_code = parse_language(language)
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    is_targeted = bool(target_question_number or target_question_id)
+    cache_key = None
+    if not is_targeted:
+        cache_key = build_cache_key(
+            "exams:review",
+            str(eid_int),
+            page=page,
+            limit=limit,
+            lang=lang_code.value,
+            status=str(status.value if hasattr(status, "value") else status) if status else None,
+        )
+        cached_data = await cache.get(cache_key)
+        if cached_data is not None:
+            return JSONResponse(content=cached_data)
+
+    q_service = QuestionService(session)
+    review_res = await q_service.get_exam_questions_for_review(
+        exam_id=eid_int,
+        page=page,
+        limit=limit,
+        language=lang_code,
+        status=status,
+        target_question_number=target_question_number,
+        target_question_id=target_question_id,
+    )
+    if review_res is not None:
+        serialized = review_res.model_dump(mode="json") if hasattr(review_res, "model_dump") else (review_res.dict() if hasattr(review_res, "dict") else review_res)
+        if not is_targeted and cache_key:
+            await cache.set(cache_key, serialized, ttl_seconds=1800)
+        return JSONResponse(content=serialized)
+    return JSONResponse(content={})
+
+
+@router.get("/{exam_id}/question-artifact/{question_number}", dependencies=[Depends(require_exam_question_visible)])
+async def get_question_artifact(
+    exam_id: int | str,
+    question_number: int,
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Fetches individual Question JSON artifact for question_number.
+    Loads from storage folder or constructs from database with secure presigned URL.
+    """
+    from app.db.models import Exam, Question
+    from app.storage.factory import get_storage_provider
+    from sqlmodel import select
+    from fastapi import HTTPException
+
+    try:
+        eid_int = int(exam_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Exam with ID '{exam_id}' not found.")
+
+    exam = await session.get(Exam, eid_int)
+    if not exam:
+        raise HTTPException(status_code=404, detail=f"Exam with ID '{exam_id}' not found.")
+
+    storage = get_storage_provider()
+    paper_set = exam.paper_set_code or "SET_A"
+    clean_set = str(paper_set).strip().lower().replace("_", "-")
+    q_folder = exam.questions_json_folder_path or f"artifacts/{exam.code}/{clean_set}/json/questions"
+    q_filename = f"Q{question_number:03d}.json"
+    rel_path = f"{q_folder.rstrip('/')}/{q_filename}"
+
+    logger.info(f"[EXAM_ARTIFACT] Querying S3 question artifact: exam_id={exam_id}, code={exam.code}, question_number={question_number}, target_path='{rel_path}'")
+
+    try:
+        if await storage.exists(rel_path):
+            presigned_url = await storage.generate_presigned_url(rel_path)
+            logger.info(f"[EXAM_ARTIFACT:S3_HIT] Generated presigned URL for question #{question_number}: {presigned_url[:60]}...")
+            return {
+                "question_number": question_number,
+                "exam_id": str(exam.id),
+                "exam_code": exam.code,
+                "presigned_url": presigned_url,
+                "source": "S3_ARTIFACT",
+            }
+        else:
+            logger.warning(f"[EXAM_ARTIFACT:S3_MISS] Question #{question_number} artifact not found at '{rel_path}'")
+    except Exception as exc:
+        logger.error(f"[EXAM_ARTIFACT:S3_ERROR] Error checking S3 path '{rel_path}': {exc}", exc_info=True)
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Question artifact #{question_number} not found in S3 storage folder.",
+    )
+
+
+@router.get("/{exam_id}/question-db/{question_number}", dependencies=[Depends(require_exam_question_visible)])
+async def get_question_from_db_fallback(
+    exam_id: int | str,
+    question_number: int,
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Dedicated Database Fallback endpoint: Directly queries PostgreSQL for question,
+    options, translations, and metadata when direct S3 download fails.
+    """
+    from fastapi import HTTPException
+    try:
+        eid_int = int(exam_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = build_cache_key("exams:q_fallback", str(eid_int), question_number)
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
+
+    from app.db.models import Exam, Question, QuestionOption, QuestionTranslation, OptionTranslation
+    from sqlmodel import select
+
+    logger.info(f"[DB_FALLBACK:QUESTION] Invoked DB fallback for Question #{question_number}, Exam ID={exam_id}")
+
+    exam = await session.get(Exam, eid_int)
+    if not exam:
+        logger.warning(f"[DB_FALLBACK:QUESTION] Exam {exam_id} not found in database.")
+        raise HTTPException(status_code=404, detail=f"Exam with ID '{exam_id}' not found.")
+
+    stmt = select(Question).where(
+        Question.exam_id == eid_int,
+        Question.question_number_in_paper == question_number,
+    )
+    res = await session.exec(stmt)
+    q = res.first()
+    if not q:
+        logger.warning(f"[DB_FALLBACK:QUESTION] Question #{question_number} not found in DB for exam '{exam.code}'.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Question #{question_number} not found in exam '{exam.code}'.",
+        )
+
+    opts_res = await session.exec(
+        select(QuestionOption).where(QuestionOption.question_id == q.id).order_by(col(QuestionOption.display_order))
+    )
+    db_opts = opts_res.all()
+
+    q_trans_res = await session.exec(
+        select(QuestionTranslation).where(QuestionTranslation.question_id == q.id)
+    )
+    db_q_trans = q_trans_res.all()
+    trans_map = {
+        (t.language.value if hasattr(t.language, "value") else str(t.language)): {
+            "question_text": t.question_text
+        }
+        for t in db_q_trans
+    }
+
+    opt_ids = [o.id for o in db_opts]
+    opt_trans_by_optid = {}
+    if opt_ids:
+        all_ot_res = await session.exec(
+            select(OptionTranslation).where(OptionTranslation.option_id.in_(opt_ids))
+        )
+        for ot in all_ot_res.all():
+            opt_trans_by_optid.setdefault(ot.option_id, []).append(ot)
+
+    opts_list = []
+    for o in db_opts:
+        db_opt_trans = opt_trans_by_optid.get(o.id, [])
+        opt_trans_map = {
+            (ot.language.value if hasattr(ot.language, "value") else str(ot.language)): ot.option_text
+            for ot in db_opt_trans
+        }
+        default_txt = db_opt_trans[0].option_text if db_opt_trans else f"Option {o.option_label}"
+        opts_list.append({
+            "option_id": str(o.id),
+            "option_label": o.option_label,
+            "text": default_txt,
+            "display_order": o.display_order,
+            "translations": opt_trans_map,
+        })
+
+    default_q_txt = db_q_trans[0].question_text if db_q_trans else f"Question #{q.question_number_in_paper}"
+    logger.info(f"[DB_FALLBACK:QUESTION_SUCCESS] Successfully retrieved Question #{question_number} from DB (options_count={len(opts_list)}) for Exam '{exam.code}'")
+
+    res_data = {
+        "question_number": question_number,
+        "exam_id": str(exam.id),
+        "exam_code": exam.code,
+        "data": {
+            "question_id": str(q.id),
+            "question_number": q.question_number_in_paper,
+            "section_code": q.section_code or "GENERAL",
+            "text": default_q_txt,
+            "translations": trans_map,
+            "options": opts_list,
+            "marks": q.marks,
+            "negative_marks": q.negative_marks,
+            "expected_time_seconds": q.expected_time_seconds or 60.0,
+        },
+        "source": "DATABASE_FALLBACK",
+    }
+    await cache.set(cache_key, res_data, ttl_seconds=3600)
+    return res_data
+
+
+@router.get("/{exam_id}/solution-artifact/{question_number}", dependencies=[Depends(require_exam_question_visible)])
+async def get_solution_artifact(
+    exam_id: int | str,
+    question_number: int,
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Fetches individual Solution JSON artifact presigned URL for question_number.
+    """
+    from app.db.models import Exam
+    from app.storage.factory import get_storage_provider
+    from fastapi import HTTPException
+
+    try:
+        eid_int = int(exam_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Exam with ID '{exam_id}' not found.")
+
+    exam = await session.get(Exam, eid_int)
+    if not exam:
+        raise HTTPException(status_code=404, detail=f"Exam with ID '{exam_id}' not found.")
+
+    storage = get_storage_provider()
+    paper_set = exam.paper_set_code or "SET_A"
+    clean_set = str(paper_set).strip().lower().replace("_", "-")
+    s_folder = exam.solutions_json_folder_path or f"artifacts/{exam.code}/{clean_set}/json/solutions"
+    q_filename = f"Q{question_number:03d}.json"
+    rel_path = f"{s_folder.rstrip('/')}/{q_filename}"
+
+    logger.info(f"[EXAM_ARTIFACT] Querying S3 solution artifact: exam_id={exam_id}, code={exam.code}, question_number={question_number}, target_path='{rel_path}'")
+
+    try:
+        if await storage.exists(rel_path):
+            presigned_url = await storage.generate_presigned_url(rel_path)
+            logger.info(f"[EXAM_ARTIFACT:S3_HIT] Generated presigned URL for solution #{question_number}: {presigned_url[:60]}...")
+            return {
+                "question_number": question_number,
+                "exam_id": str(exam.id),
+                "exam_code": exam.code,
+                "presigned_url": presigned_url,
+                "source": "S3_ARTIFACT",
+            }
+        else:
+            logger.warning(f"[EXAM_ARTIFACT:S3_MISS] Solution #{question_number} artifact not found at '{rel_path}'")
+    except Exception as exc:
+        logger.error(f"[EXAM_ARTIFACT:S3_ERROR] Error checking S3 path '{rel_path}': {exc}", exc_info=True)
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Solution artifact #{question_number} not found in S3 storage folder.",
+    )
+
+
+@router.get("/{exam_id}/solution-db/{question_number}", dependencies=[Depends(require_exam_question_visible)])
+async def get_solution_from_db_fallback(
+    exam_id: int,
+    question_number: int,
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Dedicated Database Fallback endpoint: Directly queries PostgreSQL for solution explanation,
+    correct option, and distractor closeness when S3 is unavailable.
+    """
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = build_cache_key("exams:sol_fallback", str(exam_id), question_number)
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
+
+    from app.db.models import Exam, Question, QuestionOption, OptionTranslation, QuestionExplanation, QuestionMetadata
+    from app.engine.matrices.closeness_evaluator import ClosenessEvaluator
+    from sqlmodel import select, col
+    from fastapi import HTTPException
+
+    logger.info(f"[DB_FALLBACK:SOLUTION] Invoked DB fallback for Solution #{question_number}, Exam ID={exam_id}")
+
+    exam = await session.get(Exam, exam_id)
+    if not exam:
+        logger.warning(f"[DB_FALLBACK:SOLUTION] Exam {exam_id} not found in database.")
+        raise HTTPException(status_code=404, detail=f"Exam with ID '{exam_id}' not found.")
+
+    stmt = select(Question).where(
+        Question.exam_id == exam_id,
+        Question.question_number_in_paper == question_number,
+    )
+    res = await session.exec(stmt)
+    q = res.first()
+    if not q:
+        logger.warning(f"[DB_FALLBACK:SOLUTION] Question #{question_number} not found in DB for exam '{exam.code}'.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Question #{question_number} not found in exam '{exam.code}'.",
+        )
+
+    opts_res = await session.exec(
+        select(QuestionOption).where(QuestionOption.question_id == q.id).order_by(col(QuestionOption.display_order).asc())
+    )
+    db_opts = opts_res.all()
+    correct_opt = next((o for o in db_opts if o.is_correct), None)
+    if not correct_opt:
+        logger.error(f"[DB_FALLBACK:SOLUTION] No correct option configured in DB for question #{question_number}")
+        raise HTTPException(status_code=404, detail="Correct option not configured in database.")
+
+    opt_ids = [o.id for o in db_opts]
+    opt_trans_map = {}
+    qr_map = {}
+    if opt_ids:
+        from app.db.models import QuestionOptionReasoning
+        for t in (await session.exec(select(OptionTranslation).where(OptionTranslation.option_id.in_(opt_ids)))).all():
+            existing = opt_trans_map.get(t.option_id)
+            if not existing:
+                opt_trans_map[t.option_id] = t
+            elif t.language == LanguageCode.ENGLISH or (t.distractor_analysis and not existing.distractor_analysis):
+                opt_trans_map[t.option_id] = t
+
+        for qr in (await session.exec(select(QuestionOptionReasoning).where(QuestionOptionReasoning.question_option_id.in_(opt_ids)))).all():
+            qr_map[qr.question_option_id] = qr
+
+    # English explanation (this fallback endpoint is English-only), else any language
+    expl_res = await session.exec(
+        select(QuestionExplanation)
+        .where(QuestionExplanation.question_id == q.id)
+        .order_by(case((col(QuestionExplanation.language) == LanguageCode.ENGLISH, 0), else_=1), col(QuestionExplanation.id))
+    )
+    expl_model = expl_res.first()
+
+    meta_res = await session.exec(
+        select(QuestionMetadata).where(QuestionMetadata.question_id == q.id)
+    )
+    q_meta = meta_res.first()
+
+    full_rl_source = (expl_model.reverse_logic or "").strip() if expl_model else ""
+    if not full_rl_source and expl_model and expl_model.detailed_solution and ("Reverse Logic" in expl_model.detailed_solution or "Why the other options" in expl_model.detailed_solution):
+        full_rl_source = expl_model.detailed_solution
+    if not full_rl_source:
+        for trans in opt_trans_map.values():
+            if trans and trans.distractor_analysis and ("Reverse Logic" in trans.distractor_analysis or "Why the other options" in trans.distractor_analysis or "Option (B)" in trans.distractor_analysis or "रिवर्स लॉजिक" in trans.distractor_analysis):
+                full_rl_source = trans.distractor_analysis
+                break
+
+    distractor_map = {}
+    for o in db_opts:
+        trans = opt_trans_map.get(o.id)
+        da = trans.distractor_analysis if trans and trans.distractor_analysis else None
+        if not da and o.id in qr_map:
+            qr = qr_map[o.id]
+            why_t = (qr.why_tempting or "").strip()
+            whats_t = (qr.whats_actually_true or "").strip()
+            if why_t and whats_t:
+                da = f"Why it seems tempting — {why_t}\n\nWhat's actually true — {whats_t}"
+            elif whats_t:
+                da = whats_t
+            elif why_t:
+                da = why_t
+
+        if not da and not o.is_correct and full_rl_source:
+            da = extract_option_analysis_from_text(full_rl_source, o.option_label)
+
+        if o.is_correct and da:
+            da = clean_correct_option_text(da)
+
+        closeness = getattr(o, "distractor_closeness_score", 0.0) or (1.0 if o.is_correct else 0.0)
+        cls_tier = ClosenessEvaluator.classify_option(closeness)
+        distractor_map[str(o.id)] = {
+            "option_id": str(o.id),
+            "label": o.option_label,
+            "text": trans.option_text if trans else f"Option {o.option_label}",
+            "closeness_score": closeness,
+            "is_correct": o.is_correct,
+            "classification": cls_tier,
+            "distractor_analysis": da or "",
+            "analysis": da or "",
+        }
+
+    detailed_solution = (expl_model.detailed_solution if (expl_model and expl_model.detailed_solution) else (
+        f"**Option ({correct_opt.option_label}) is correct.**\n\nStandard constitutional and syllabus reasoning."
+    ))
+
+    core_concept = expl_model.core_concept if expl_model and expl_model.core_concept else "Core conceptual analysis"
+    common_traps = expl_model.common_traps_json if (expl_model and expl_model.common_traps_json) else []
+    key_takeaways = expl_model.key_takeaways_json if (expl_model and expl_model.key_takeaways_json) else []
+
+    blooms_level = (q_meta.blooms_level.value if hasattr(q_meta.blooms_level, "value") else str(q_meta.blooms_level)) if (q_meta and q_meta.blooms_level) else "ANALYZE"
+    cognitive_skill = q_meta.cognitive_skill if q_meta and q_meta.cognitive_skill else "Conceptual Reasoning"
+    primary_concept_tag = q_meta.primary_concept_tag if q_meta and q_meta.primary_concept_tag else None
+
+    logger.info(f"[DB_FALLBACK:SOLUTION_SUCCESS] Successfully retrieved Solution #{question_number} from DB for Exam '{exam.code}' (correct_opt={correct_opt.option_label})")
+
+    res_data = {
+        "question_id": str(q.id),
+        "question_number": question_number,
+        "exam_id": str(exam.id),
+        "exam_code": exam.code,
+        "correct_option_id": str(correct_opt.id),
+        "correct_option_label": correct_opt.option_label,
+        "difficulty": q.difficulty.value if hasattr(q.difficulty, 'value') else str(q.difficulty),
+        "blooms_level": blooms_level,
+        "cognitive_skill": cognitive_skill,
+        "primary_concept_tag": primary_concept_tag,
+        "irt_params": {
+            "a": q_meta.irt_discrimination_a if q_meta and q_meta.irt_discrimination_a is not None else 1.50,
+            "b": q_meta.irt_difficulty_b if q_meta and q_meta.irt_difficulty_b is not None else 0.00,
+            "c": q_meta.irt_pseudo_guessing_c if q_meta and q_meta.irt_pseudo_guessing_c is not None else 0.25,
+        },
+        "subject": "General Studies",
+        "topic": "Syllabus Topic",
+        "subtopic": "Micro Topic",
+        "explanation": {
+            "core_concept": core_concept,
+            "detailed_solution": detailed_solution,
+            "common_traps": common_traps,
+            "key_takeaways": key_takeaways,
+        },
+        "distractor_scores": distractor_map,
+        "data": {
+            "question_id": str(q.id),
+            "question_number": q.question_number_in_paper,
+            "correct_option_id": str(correct_opt.id),
+            "correct_option_label": correct_opt.option_label,
+            "explanation": {
+                "text": detailed_solution,
+                "detailed_solution": detailed_solution,
+                "core_concept": core_concept,
+                "key_takeaways": key_takeaways,
+                "common_traps": common_traps,
+            },
+            "distractor_scores": distractor_map,
+        },
+        "source": "DATABASE_FALLBACK",
+    }
+    await cache.set(cache_key, res_data, ttl_seconds=3600)
+    return jsonable_encoder(res_data)
+
+
+
+@router.get("/export-zip", dependencies=[Depends(require_admin_section("admin.upload", "admin.review", "admin.question_bank"))])
+async def download_exam_export_zip(
+    background_tasks: BackgroundTasks,
+    exam_name: str = Query(
+        ...,
+        description="Exam name in the uploaded 5-token format e.g. 'upsc_cse-prelims-gs1-2023-A' or 'upsc_cse-prelims-gs1-2023-A.pdf'",
+    ),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Generates and downloads a production ZIP bundle containing all Pipeline 1-3 extracted information:
+    - Per-question Markdown files (statements, options, correct answers, metadata, explanations, key takeaways, option distractor analysis).
+    - Master SUMMARY_WEIGHTAGE.md (answer key & Subject/Topic/Subtopic weightage distribution).
+    """
+    export_service = ExamExportService(session)
+    zip_path, filename = await export_service.create_exam_export_zip(exam_name)
+
+    background_tasks.add_task(_remove_temp_file, str(zip_path))
+
+    return FileResponse(
+        path=str(zip_path),
+        filename=filename,
+        media_type="application/zip",
+    )
+
+
+@router.get("/{exam_name:path}/export-zip", dependencies=[Depends(require_admin_section("admin.upload", "admin.review", "admin.question_bank"))])
+async def download_exam_export_zip_path(
+    exam_name: str,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Path parameter alias for downloading exam export ZIP archives."""
+    export_service = ExamExportService(session)
+    zip_path, filename = await export_service.create_exam_export_zip(exam_name)
+
+    background_tasks.add_task(_remove_temp_file, str(zip_path))
+
+    return FileResponse(
+        path=str(zip_path),
+        filename=filename,
+        media_type="application/zip",
+    )
+
+
+@router.get(
+    "/by-year",
+    response_model=ExamsByYearResponse,
+    summary="Get Exams Grouped by Year",
+)
+@router.get(
+    "/years",
+    response_model=ExamsByYearResponse,
+    summary="Get Exams Grouped by Year (Alias)",
+)
+async def get_exams_by_year(
+    force_refresh: bool = Query(default=False, description="Bypass cache and recalculate exams by year"),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Returns all available exams grouped chronologically by exam year (e.g. 2024, 2023, 2019)
+    along with question counts, pipeline status, and publication flags.
+    """
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = build_cache_key("exams:by_year")
+    if not force_refresh:
+        cached_data = await cache.get(cache_key)
+        if cached_data is not None:
+            return JSONResponse(content=cached_data)
+
+    service = SyllabusService(session)
+    response = await service.get_exams_by_year()
+    serialized = jsonable_encoder(response)
+    await cache.set(cache_key, serialized, ttl_seconds=300)
+    return JSONResponse(content=serialized)
+
+
+@router.get("/{exam_id}")
+async def get_exam_detail(
+    exam_id: int, session: AsyncSession = Depends(get_async_session)
+):
+    """Fetches details of a specific exam by ID."""
+    service = ExamService(session)
+    exam = await service.get_exam_detail(exam_id)
+    return JSONResponse(content=jsonable_encoder(exam, exclude=EXAM_RELATIONSHIP_FIELDS))
+
+
+@router.delete("/{exam_id}")
+async def delete_exam_endpoint(
+    exam_id: int | str,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_admin_section("admin.upload")),
+):
+    """
+    Permanently deletes an exam and all associated data (questions, options,
+    review tasks, answer keys, attempts, pipeline runs, syllabus links) from database and cache.
+    Admin/Super Admin only.
+    """
+    from fastapi import HTTPException
+    service = ExamService(session)
+    success = await service.delete_exam(exam_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Exam with ID {exam_id} not found.")
+    return {
+        "success": True,
+        "status": "SUCCESS",
+        "message": f"Exam {exam_id} and all associated database records and cache successfully deleted.",
+        "exam_id": str(exam_id),
+    }
+
+
+
+@router.get(
+    "/{exam_id}/syllabus",
+    response_model=CompleteSyllabusResponse,
+    summary="Get Complete Syllabus for Specific Exam",
+)
+async def get_exam_syllabus(
+    exam_id: int,
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Returns the complete 3-level syllabus tree mapped to this exam's active SyllabusVersion.
+    """
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = build_cache_key("exams:syllabus", str(exam_id))
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return JSONResponse(content=cached_data)
+
+    service = SyllabusService(session)
+    response = await service.get_complete_syllabus(exam_id=exam_id)
+    serialized = jsonable_encoder(response)
+    await cache.set(cache_key, serialized, ttl_seconds=72000)
+    return JSONResponse(content=serialized)
+
+
+@router.get(
+    "/{exam_id}/integrity-questions",
+    response_model=ExamIntegrityQuestionsResponse,
+    summary="Get Paginated Question Integrity & Issue Breakdown for Exam Review",
+)
+async def get_exam_integrity_questions(
+    exam_id: int,
+    issue_type: Optional[str] = Query(
+        default=None,
+        description="Filter by issue type: 'ALL_ISSUES', 'CORRUPTED', 'PARTIALLY_CORRUPTED', 'MISSING_IN_PAPER', 'VALID'",
+    ),
+    language: str = Query(default="en", description="Language"),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    limit: int = Query(default=250, ge=1, le=500, description="Items per page"),
+    force_refresh: bool = Query(default=False, description="Bypass cache and recalculate integrity diagnostics"),
+    session: AsyncSession = Depends(get_async_session),
+    _reviewer: User = Depends(view_exam_review),
+):
+    """
+    Inspects database integrity across all questions in an exam.
+    Returns categorized questions ('CORRUPTED', 'PARTIALLY_CORRUPTED', 'MISSING_IN_PAPER', 'VALID')
+    with precise diagnostic issue descriptions, options/statement status, and pagination.
+    """
+    lang_code = parse_language(language)
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = build_cache_key(
+        "exams:integrity",
+        str(exam_id),
+        issue_type or "ALL",
+        page=page,
+        limit=limit,
+        lang=lang_code.value,
+    )
+    if not force_refresh:
+        cached_data = await cache.get(cache_key)
+        if cached_data is not None:
+            return JSONResponse(content=cached_data)
+
+    service = SyllabusService(session)
+    response = await service.get_exam_question_integrity(
+        exam_id=exam_id,
+        issue_type=issue_type,
+        page=page,
+        limit=limit,
+        language=lang_code,
+    )
+    serialized = jsonable_encoder(response)
+    if not getattr(response, "is_extracting", False):
+        await cache.set(cache_key, serialized, ttl_seconds=300)
+    return JSONResponse(content=serialized)
+
+

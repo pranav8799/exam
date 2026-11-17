@@ -1,0 +1,67 @@
+# Logs rotate at 50 MB x 10 files per service (~2-4 weeks at internal-release traffic). Read them with
+# `docker compose -f docker-compose.prod.yml logs --since 24h api`.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "10"
+
+services:
+  api:
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER}/examplanner-backend:latest
+    # Loopback only: the API is reached through the web container's nginx (/api/). Publishing it on all
+    # interfaces would let anyone skip TLS, rate limits and the X-Client-App header the proxies set.
+    # (Docker's published ports bypass ufw, so the bind address is what keeps it private.)
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    networks:
+      - app-network
+
+    restart: unless-stopped
+    logging: *default-logging
+
+  web:
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER}/examplanner-frontend:latest
+    # Loopback only: the host nginx (deploy/nginx/examplanner.in.conf) terminates TLS and proxies here.
+    ports:
+      - "127.0.0.1:3000:80"
+    networks:
+      - app-network
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Public marketing site (Astro SSR). Host nginx routes the marketing paths here and the rest to `web`;
+  # see deploy/nginx/examplanner.in.conf.
+  marketing:
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER}/examplanner-marketing:latest
+    ports:
+      - "127.0.0.1:3020:4321"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - app-network
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Super Admin app (its own origin). Bound to loopback: put a TLS-terminating reverse proxy for the
+  # Super Admin host in front of it, and restrict that host (VPN / IP allowlist).
+  superadmin:
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER}/examplanner-superadmin:latest
+    ports:
+      - "127.0.0.1:3010:80"
+    depends_on:
+      - api
+    networks:
+      - app-network
+    restart: unless-stopped
+    logging: *default-logging
+
+
+networks:
+  app-network:
+    driver: bridge
+

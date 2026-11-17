@@ -1,0 +1,921 @@
+from typing import Optional
+import re
+from fastapi import APIRouter, Depends, Query, status
+from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
+from sqlmodel.ext.asyncio.session import AsyncSession
+from fastapi import HTTPException
+from app.db.session import get_async_session
+from app.db.models import QuestionStatus, QuestionSourceType, DifficultyLevel, LanguageCode
+from app.db.models.user import User, UserRole
+from app.core.languages import parse_language
+from app.core.deps import require_roles, require_admin_section, get_optional_user, can_see_unpublished, require_question_visible
+from app.schemas.question import (
+    QuestionUpdatePayload,
+    QuestionCreatePayload,
+    QuestionDetailResponse,
+    QuestionPaginatedResponse,
+)
+from app.services.question_service import QuestionService
+from app.schemas.knowledge import SimilarQuestionsResponse, QuestionKnowledgeResponse
+from app.pipeline.patterns import extract_option_analysis_from_text, clean_correct_option_text
+
+
+
+router = APIRouter(prefix="/questions", tags=["Questions & Formatted Outputs"])
+
+
+@router.get("", response_model=QuestionPaginatedResponse, summary="Get Questions with Multi-Filtering & Pagination")
+async def list_questions(
+    subject_id: Optional[int] = Query(default=None, description="Filter by Subject ID"),
+    subject_name: Optional[str] = Query(default=None, description="Filter by Subject Name (substring match)"),
+    subject_code: Optional[str] = Query(default=None, description="Filter by Subject Code"),
+    topic_id: Optional[int] = Query(default=None, description="Filter by Topic ID"),
+    topic_name: Optional[str] = Query(default=None, description="Filter by Topic Name (substring match)"),
+    topic_code: Optional[str] = Query(default=None, description="Filter by Topic Code"),
+    subtopic_id: Optional[int] = Query(default=None, description="Filter by Subtopic ID"),
+    subtopic_name: Optional[str] = Query(default=None, description="Filter by Subtopic Name (substring match)"),
+    subtopic_code: Optional[str] = Query(default=None, description="Filter by Subtopic Code"),
+    exam_id: Optional[int] = Query(default=None, description="Filter by Exam ID"),
+    exam_name: Optional[str] = Query(default=None, description="Filter by Exam Name e.g. upsc (substring match)"),
+    exam_type: Optional[QuestionSourceType] = Query(default=None, description="Filter by Exam Type e.g. PYQ or STATIC_MOCK"),
+    exam_year: Optional[str] = Query(default=None, description="Filter by Exam Year e.g. 2023 or comma-separated e.g. 2023,2024"),
+    paper_set_code: Optional[str] = Query(default=None, description="Filter by Paper Set Code e.g. SET_A"),
+    stage: Optional[str] = Query(default=None, description="Filter by Stage e.g. prelims"),
+    status: Optional[QuestionStatus] = Query(default=None, description="Filter by Status e.g. PENDING_HUMAN_REVIEW or PUBLISHED"),
+    difficulty: Optional[str] = Query(default=None, description="Filter by Difficulty e.g. EASY, MEDIUM, HARD ('All Levels' = no filter)"),
+    language: str = Query(default="en", description="Target Language for response text (ISO code 'en', 'hi' or Enum name 'ENGLISH')"),
+    include_solutions: bool = Query(default=False, description="Whether to include full solution explanations and option distractor analyses"),
+    exclude_ids: Optional[str] = Query(default=None, description="Comma-separated Question IDs to exclude from results"),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    limit: int = Query(default=20, ge=1, le=100, description="Items per page"),
+    session: AsyncSession = Depends(get_async_session),
+    viewer: Optional[User] = Depends(get_optional_user),
+):
+    """
+    Students and anonymous visitors are only ever served PUBLISHED questions; staff can filter by any status.
+
+    Requirement 3: Endpoint to get all questions with multi-filtering based on subjects, topics, subtopics,
+    exam type, exam year, exam set, stage, and exam name (case-insensitive substring match e.g. 'upsc'),
+    with pagination ordered by question number in paper.
+    By default, solution explanations are omitted (include_solutions=False) to protect test-taking integrity.
+    """
+    if not can_see_unpublished(viewer):
+        status = QuestionStatus.PUBLISHED
+
+    if difficulty and difficulty.strip().lower() in ("all", "all levels", "all difficulties"):
+        difficulty = None
+    if difficulty and difficulty.strip():
+        difficulty = difficulty.strip().upper()
+        if difficulty not in DifficultyLevel.__members__:
+            raise HTTPException(
+                status_code=400,  # `status` is the query parameter here
+                detail=f"Invalid difficulty: '{difficulty}'. Allowed values: {[d.value for d in DifficultyLevel]}",
+            )
+
+    lang_code = parse_language(language)
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    should_cache = not bool(exclude_ids)
+    cache_key = None
+    if should_cache:
+        cache_key = build_cache_key(
+            "questions:list",
+            subject_id=subject_id,
+            subject_name=subject_name,
+            subject_code=subject_code,
+            topic_id=topic_id,
+            topic_name=topic_name,
+            topic_code=topic_code,
+            subtopic_id=subtopic_id,
+            subtopic_name=subtopic_name,
+            subtopic_code=subtopic_code,
+            exam_id=exam_id,
+            exam_name=exam_name,
+            exam_type=str(exam_type.value if hasattr(exam_type, "value") else exam_type) if exam_type else None,
+            exam_year=exam_year,
+            paper_set_code=paper_set_code,
+            stage=stage,
+            status=str(status.value if hasattr(status, "value") else status) if status else None,
+            difficulty=difficulty,
+            language=lang_code.value,
+            include_solutions=include_solutions,
+            page=page,
+            limit=limit,
+        )
+        cached_data = await cache.get(cache_key)
+        if cached_data is not None:
+            return JSONResponse(content=cached_data)
+
+    service = QuestionService(session)
+    res = await service.list_questions_paginated(
+        subject_id=subject_id,
+        subject_name=subject_name,
+        subject_code=subject_code,
+        topic_id=topic_id,
+        topic_name=topic_name,
+        topic_code=topic_code,
+        subtopic_id=subtopic_id,
+        subtopic_name=subtopic_name,
+        subtopic_code=subtopic_code,
+        exam_id=exam_id,
+        exam_name=exam_name,
+        exam_type=exam_type,
+        exam_year=exam_year,
+        paper_set_code=paper_set_code,
+        stage=stage,
+        status=status,
+        difficulty=difficulty,
+        language=lang_code,
+        include_solutions=include_solutions,
+        exclude_ids=exclude_ids,
+        page=page,
+        limit=limit,
+    )
+    if res is not None:
+        serialized = res.model_dump(mode="json") if hasattr(res, "model_dump") else (res.dict() if hasattr(res, "dict") else res)
+        if should_cache and cache_key:
+            await cache.set(cache_key, serialized, ttl_seconds=600)
+        return JSONResponse(content=serialized)
+    return JSONResponse(content={})
+
+
+
+@router.get("/taxonomy", summary="Get Dynamic Syllabus Taxonomy (Subjects, Topics & Subtopics) from Database")
+async def get_syllabus_taxonomy(
+    subject_name: Optional[str] = Query(default=None, description="Filter by Subject Name"),
+    topic_name: Optional[str] = Query(default=None, description="Filter by Topic Name"),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Fetches all available Subjects, Topics, and Subtopics dynamically from the Database hierarchy
+    and fallback master SYLLABUS_HIERARCHY with full 3-level tree support and caching.
+    """
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = build_cache_key("questions:taxonomy", subject_name or "", topic_name or "")
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return JSONResponse(content=jsonable_encoder(cached_data))
+
+    from app.db.models import Subject, Topic, Subtopic
+    from app.schemas.syllabus_literals import SYLLABUS_HIERARCHY
+    from sqlmodel import select
+
+    three_level_hierarchy: dict[str, dict[str, list[str]]] = {}
+    flat_hierarchy: dict[str, list[str]] = {}
+    all_subjects_set = set()
+    all_topics_set = set()
+    all_subtopics_set = set()
+
+    try:
+        stmt = (
+            select(Subject.name, Topic.name, Subtopic.name)
+            .outerjoin(Topic, Topic.subject_id == Subject.id)
+            .outerjoin(Subtopic, Subtopic.topic_id == Topic.id)
+        )
+        if subject_name and subject_name != "All Subjects":
+            stmt = stmt.where(Subject.name.ilike(f"%{subject_name.strip()}%"))
+        if topic_name and topic_name != "All Topics":
+            stmt = stmt.where(Topic.name.ilike(f"%{topic_name.strip()}%"))
+
+        res = await session.exec(stmt)
+        rows = res.all()
+        for s_raw, t_raw, st_raw in rows:
+            if not s_raw:
+                continue
+            s_name = s_raw.strip()
+            all_subjects_set.add(s_name)
+            if s_name not in three_level_hierarchy:
+                three_level_hierarchy[s_name] = {}
+
+            if t_raw:
+                t_name = t_raw.strip()
+                all_topics_set.add(t_name)
+                if t_name not in three_level_hierarchy[s_name]:
+                    three_level_hierarchy[s_name][t_name] = []
+                if t_name not in flat_hierarchy:
+                    flat_hierarchy[t_name] = []
+
+                if st_raw:
+                    st_name = st_raw.strip()
+                    all_subtopics_set.add(st_name)
+                    if st_name not in three_level_hierarchy[s_name][t_name]:
+                        three_level_hierarchy[s_name][t_name].append(st_name)
+                    if st_name not in flat_hierarchy[t_name]:
+                        flat_hierarchy[t_name].append(st_name)
+
+    except Exception:
+        pass
+
+    # Fallback to master SYLLABUS_HIERARCHY if database returned empty
+    if not three_level_hierarchy:
+        for s_name, t_dict in SYLLABUS_HIERARCHY.items():
+            if subject_name and subject_name != "All Subjects" and subject_name.lower() not in s_name.lower():
+                continue
+            all_subjects_set.add(s_name)
+            if s_name not in three_level_hierarchy:
+                three_level_hierarchy[s_name] = {}
+            for t_name, st_list in t_dict.items():
+                if topic_name and topic_name != "All Topics" and topic_name.lower() not in t_name.lower():
+                    continue
+                all_topics_set.add(t_name)
+                three_level_hierarchy[s_name][t_name] = list(st_list)
+                flat_hierarchy[t_name] = list(st_list)
+                for st in st_list:
+                    all_subtopics_set.add(st)
+
+    # Format sorted lists with "All ..." options
+    for s_name, t_map in three_level_hierarchy.items():
+        for t_name, st_arr in t_map.items():
+            three_level_hierarchy[s_name][t_name] = ["All Subtopics"] + sorted(st_arr)
+
+    for t_name, st_arr in flat_hierarchy.items():
+        flat_hierarchy[t_name] = ["All Subtopics"] + sorted(st_arr)
+
+    sorted_subjects = sorted(list(all_subjects_set))
+    sorted_topics = sorted(list(all_topics_set))
+    sorted_subtopics = sorted(list(all_subtopics_set))
+
+    result = {
+        "subjects": ["All Subjects"] + sorted_subjects,
+        "topics": ["All Topics"] + sorted_topics,
+        "subtopics": ["All Subtopics"] + sorted_subtopics,
+        "hierarchy": three_level_hierarchy,
+        "flat_hierarchy": flat_hierarchy,
+    }
+    await cache.set(cache_key, result, ttl_seconds=7200)
+    return JSONResponse(content=jsonable_encoder(result))
+
+
+@router.post("", response_model=QuestionDetailResponse, status_code=status.HTTP_201_CREATED, summary="Create New or Missing Question & Publish")
+async def create_question(
+    payload: QuestionCreatePayload,
+    session: AsyncSession = Depends(get_async_session),
+    _admin: User = Depends(require_admin_section("admin.review", "admin.reported_questions")),
+):
+    """
+    Creates a new question (or fills in a missing question) for an exam paper.
+    Automatically sets Question status to PUBLISHED and updates Exam missing question metrics.
+    """
+    from app.cache import invalidate_question_cache, invalidate_exam_cache
+    service = QuestionService(session)
+    res = await service.create_question(payload=payload)
+    if res and res.question_id:
+        await invalidate_question_cache(str(res.question_id), str(payload.exam_id) if payload.exam_id else None)
+    if payload.exam_id:
+        await invalidate_exam_cache(str(payload.exam_id))
+    return res
+
+
+@router.get("/recommended", summary="Lightweight Recommended Questions (no passages/metadata/hierarchy-detail/solutions)")
+async def list_recommended_questions(
+    subject_name: Optional[str] = Query(default=None, description="Filter by Subject Name (substring match)"),
+    topic_name: Optional[str] = Query(default=None, description="Filter by Topic Name (substring match)"),
+    subtopic_name: Optional[str] = Query(default=None, description="Filter by Subtopic Name (substring match)"),
+    exam_name: Optional[str] = Query(default=None, description="Filter by Exam Name e.g. upsc (substring match)"),
+    difficulty: Optional[str] = Query(default=None, description="Filter by Difficulty e.g. EASY, MEDIUM, HARD"),
+    exclude_ids: Optional[str] = Query(default=None, description="Comma-separated Question IDs to exclude from results"),
+    language: str = Query(default="en", description="Target Language for response text"),
+    limit: int = Query(default=15, ge=1, le=50, description="Max recommended questions to return"),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Minimal per-question payload (text + options + subject/topic/subtopic
+    names) for "recommended questions" sidebars/cards. Unlike the general
+    listing endpoint above, this skips passages, metadata, multi-concept
+    hierarchy detail, and explanations entirely — a recommendation card
+    doesn't render any of that, and solutions are still fetched lazily via
+    GET /questions/{question_id}/solution only when a recommendation is
+    actually revealed.
+    """
+    if difficulty and difficulty.strip() and difficulty.strip().lower() not in ("all", "all levels", "all difficulties"):
+        diff_upper = difficulty.strip().upper()
+        if diff_upper not in DifficultyLevel.__members__:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid difficulty: '{difficulty}'. Allowed values: {[d.value for d in DifficultyLevel]}",
+            )
+
+    lang_code = parse_language(language)
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = None
+    if not exclude_ids:
+        cache_key = build_cache_key(
+            "questions:recommended",
+            s=subject_name,
+            t=topic_name,
+            st=subtopic_name,
+            e=exam_name,
+            d=difficulty,
+            l=lang_code.value,
+            lim=limit,
+        )
+        cached = await cache.get(cache_key)
+        if cached is not None:
+            return JSONResponse(content=cached)
+
+    service = QuestionService(session)
+    res = await service.list_recommended_questions(
+        subject_name=subject_name,
+        topic_name=topic_name,
+        subtopic_name=subtopic_name,
+        exam_name=exam_name,
+        difficulty=difficulty,
+        exclude_ids=exclude_ids,
+        language=lang_code,
+        limit=limit,
+    )
+    if cache_key and res:
+        await cache.set(cache_key, res, ttl_seconds=300)
+    return JSONResponse(content=res)
+
+
+CANONICAL_SUBJECT_MAP = {
+    "polity": ["polity", "indian polity", "indian polity and governance", "governance"],
+    "history": ["history", "modern history", "medieval history", "ancient history", "indian history", "indian history and culture"],
+    "art_culture": ["art and culture", "arts and culture", "indian culture"],
+    "geography": ["geography", "human and economic geography"],
+    "economy": ["economy", "economics", "indian economy"],
+    "environment": ["environment", "environment and ecology", "ecology and environment"],
+    "science": ["science and technology", "science and tech", "general science", "physics", "chemistry", "biology", "computer science"],
+    "social_security": ["social security in india", "insurance and social security principles", "labour laws and industrial relations"],
+}
+
+
+def _norm_tax_str(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    import re
+    s = s.lower().strip().replace("–", "-").replace("—", "-").replace("&", "and")
+    return re.sub(r"\s+", " ", s)
+
+
+def _subject_matches(s1: Optional[str], s2: Optional[str]) -> bool:
+    n1, n2 = _norm_tax_str(s1), _norm_tax_str(s2)
+    if not n1 or not n2:
+        return False
+    if n1 == n2:
+        return True
+    for group in CANONICAL_SUBJECT_MAP.values():
+        if any(n1 == g or g in n1 for g in group) and any(n2 == g or g in n2 for g in group):
+            return True
+    return False
+
+
+def _taxonomy_matches(t1: Optional[str], t2: Optional[str]) -> bool:
+    if not t1 or not t2:
+        return False
+    n1, n2 = _norm_tax_str(t1), _norm_tax_str(t2)
+    if n1 == n2:
+        return True
+    if len(n1) >= 4 and len(n2) >= 4 and (n1 in n2 or n2 in n1):
+        return True
+    return False
+
+
+@router.get(
+    "/{question_id}/similar",
+    response_model=SimilarQuestionsResponse,
+    summary="Similar Questions via AI Knowledge Tags (Jaccard) or Knowledge Layer fallback",
+    dependencies=[Depends(require_question_visible)],
+)
+async def get_similar_questions(
+    question_id: int | str,
+    limit: int = Query(default=5, ge=1, le=50),
+    min_score: float = Query(default=0, ge=0),
+    include_related: bool = Query(default=True, description="Also match through relationships (e.g. Suba -> Sarkar)"),
+    include_question: bool = Query(default=False, description="Embed each result's question card (text + options)"),
+    language: str = Query(default="en", description="Language of embedded question cards"),
+    other_years_only: bool = Query(default=False, description="Only questions from other years (the same theme in other papers)"),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Published questions most related to this one.
+    First tries to use AI Knowledge Tags (Jaccard Similarity).
+    If no AI tags exist yet, falls back to deterministic Knowledge Layer (exact entity > concept > taxonomy).
+    Filters candidates so only questions matching the main question's subject, topic, and subtopic are shown.
+    """
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    from app.db.models.question import Question
+    target_q = await session.get(Question, qid_int)
+    if not target_q:
+        raise HTTPException(status_code=404, detail="Question not found")
+        
+    service = QuestionService(session)
+
+    # Fetch wider pool of candidates so taxonomy filtering has sufficient candidates
+    fetch_limit = max(50, limit * 5)
+
+    async def _from_other_years(results: list) -> list:
+        if not other_years_only or not results:
+            return results
+        from sqlmodel import select, col
+        from app.db.models.hierarchy import Exam
+
+        def year_of(q, exam_years):
+            return q.source_year or exam_years.get(q.exam_id)
+
+        ids = [int(r["question_id"]) for r in results if r.get("question_id") is not None]
+        rows = (await session.exec(select(Question).where(col(Question.id).in_(ids + [target_q.id])))).all()
+        exam_years = dict((await session.exec(
+            select(Exam.id, Exam.source_year).where(col(Exam.id).in_({q.exam_id for q in rows if q.exam_id}))
+        )).all())
+        by_id = {q.id: q for q in rows}
+        own_year = year_of(target_q, exam_years)
+        kept = []
+        for r in results:
+            q = by_id.get(int(r["question_id"])) if r.get("question_id") is not None else None
+            if q is None or q.exam_id == target_q.exam_id:
+                continue
+            year = year_of(q, exam_years)
+            if own_year is not None and year == own_year:
+                continue
+            r.setdefault("source_year", year)
+            kept.append(r)
+        return kept
+
+    async def _filter_by_taxonomy(candidates: list) -> list:
+        if not candidates:
+            return []
+
+        from app.db.models.hierarchy import Subtopic, Topic, Subject
+        from sqlmodel import select
+        t_st, t_top, t_sub = None, None, None
+        if target_q.subtopic_id:
+            st_row = (await session.exec(
+                select(Subtopic.name, Topic.name, Subject.name)
+                .select_from(Subtopic)
+                .join(Topic, Topic.id == Subtopic.topic_id, isouter=True)
+                .join(Subject, Subject.id == Topic.subject_id, isouter=True)
+                .where(Subtopic.id == target_q.subtopic_id)
+            )).first()
+            if st_row:
+                t_st, t_top, t_sub = st_row
+        t_sub = t_sub or target_q.subject_raw
+        t_top = t_top or target_q.topic_raw
+        t_st = t_st or target_q.subtopic_raw
+
+        if not t_sub:
+            return candidates[:limit]
+
+        # 1. Subject match is strictly required
+        same_subj = []
+        for c in candidates:
+            c_subj = c.get("subject_name") or (c.get("question") or {}).get("subject_name")
+            if c_subj and _subject_matches(c_subj, t_sub):
+                same_subj.append(c)
+
+        if not same_subj:
+            return []
+
+        # 2. Prefer questions matching subtopic
+        if t_st:
+            st_matches = [
+                c for c in same_subj
+                if _taxonomy_matches(c.get("subtopic_name") or (c.get("question") or {}).get("subtopic_name"), t_st)
+            ]
+            if st_matches:
+                return st_matches[:limit]
+
+        # 3. Prefer questions matching topic
+        if t_top:
+            top_matches = [
+                c for c in same_subj
+                if _taxonomy_matches(c.get("topic_name") or (c.get("question") or {}).get("topic_name"), t_top)
+            ]
+            if top_matches:
+                return top_matches[:limit]
+
+        # 4. Fallback to same subject
+        return same_subj[:limit]
+
+    if target_q.knowledge_tags_ai:
+        # Use AI Jaccard Similarity; if it finds nothing, fall through to the deterministic layer
+        raw_ai = await service.get_similar_questions(qid_int, limit=fetch_limit)
+        results = await _filter_by_taxonomy(await _from_other_years(raw_ai))
+        if results:
+            if include_question:
+                from sqlmodel import select, col
+                lang_code = parse_language(language)
+                q_ids = [int(r["question_id"]) for r in results]
+                rows = (await session.exec(select(Question).where(col(Question.id).in_(q_ids)))).all()
+                cards = await service._build_light_recommendation_cards(list(rows), target_lang=lang_code)
+                by_id = {int(c["question_id"]): c for c in cards if c.get("question_id")}
+                for r in results:
+                    r["question"] = by_id.get(int(r["question_id"]))
+            else:
+                for r in results:
+                    r.pop("question", None)
+            return JSONResponse(content={"question_id": qid_int, "results": jsonable_encoder(results)})
+
+    # Fallback to Original Deterministic Similarity
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    lang_code = parse_language(language)
+    cache_key = build_cache_key(
+        "questions:similar", str(qid_int), lim=limit, min=min_score, rel=include_related,
+        q=include_question, l=lang_code.value if include_question else None, oy=other_years_only,
+    )
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        return JSONResponse(content=cached)
+
+    from app.knowledge.similarity import SimilarityService
+    raw_det = await SimilarityService(session).find_similar(
+        qid_int, limit=fetch_limit, min_score=min_score, include_related=include_related
+    )
+    results = await _filter_by_taxonomy(await _from_other_years(raw_det))
+    if include_question and results:
+        from sqlmodel import select, col
+        q_ids = [int(r["question_id"]) for r in results if r.get("question_id") is not None]
+        rows = (await session.exec(select(Question).where(col(Question.id).in_(q_ids)))).all()
+        cards = await service._build_light_recommendation_cards(list(rows), target_lang=lang_code)
+        
+        by_id = {}
+        for c in cards:
+            if c.get("question_id"):
+                by_id[int(c["question_id"])] = c
+                
+        for r in results:
+            q_id = r.get("question_id")
+            if q_id is not None:
+                r["question"] = by_id.get(int(q_id))
+    
+    # Map the deterministic score to an absolute percentage (60 points ≈ strong exact match = 99%)
+    for r in results:
+        if "similarity_score" not in r:
+            r["similarity_score"] = int(max(1, min(round(r.get("score", 0) / 60 * 100), 99)))
+            
+    data = jsonable_encoder(SimilarQuestionsResponse(question_id=qid_int, results=results))
+    await cache.set(cache_key, data, ttl_seconds=600)
+    return JSONResponse(content=data)
+
+
+
+@router.get(
+    "/{question_id}/knowledge",
+    response_model=QuestionKnowledgeResponse,
+    summary="Question's Knowledge Layer: concepts, entities and relationships",
+    dependencies=[Depends(require_question_visible)],
+)
+async def get_question_knowledge(
+    question_id: int | str,
+    session: AsyncSession = Depends(get_async_session),
+):
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    from app.knowledge.queries import load_question_knowledge
+    return await load_question_knowledge(session, qid_int)
+
+@router.get("/assets/{asset_id}/image", summary="Get a Question's Diagram/Picture Image")
+async def get_question_asset_image(
+    asset_id: int,
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Streams a cropped question diagram. Public so it can be used directly as an <img src>."""
+    from fastapi.responses import FileResponse
+    from app.db.models import QuestionAsset
+    from app.services.question_assets import local_asset_file
+
+    asset = await session.get(QuestionAsset, asset_id)
+    if asset is None or not asset.asset_path:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    try:
+        file_path = await local_asset_file(asset)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Asset file not found.")
+    return FileResponse(path=str(file_path), headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.get("/{question_id}", response_model=QuestionDetailResponse, summary="Get Question Detail by ID", dependencies=[Depends(require_question_visible)])
+async def get_question(
+    question_id: int | str,
+    language: str = Query(default="en", description="Target Language"),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Requirement 8: Takes question ID and language, returning complete information across all tables
+    (question text, passage text, options, paper set, difficulty, marks, explanation, metadata, hierarchy links).
+    """
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Question with ID '{question_id}' not found.")
+
+    lang_code = parse_language(language)
+    from app.cache import get_cache, build_cache_key
+    cache = get_cache()
+    cache_key = build_cache_key(
+        "questions:detail",
+        str(qid_int),
+        lang=lang_code.value,
+    )
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return JSONResponse(content=cached_data)
+
+    service = QuestionService(session)
+    detail = await service.get_question_detail(question_id=qid_int, language=lang_code)
+    if detail is not None:
+        serialized = detail.model_dump(mode="json") if hasattr(detail, "model_dump") else (detail.dict() if hasattr(detail, "dict") else detail)
+        await cache.set(cache_key, serialized, ttl_seconds=3600)
+        return JSONResponse(content=serialized)
+    return JSONResponse(content={})
+
+
+@router.put("/{question_id}", response_model=QuestionDetailResponse, summary="Update Question & Publish")
+async def update_question(
+    question_id: int | str,
+    payload: QuestionUpdatePayload,
+    session: AsyncSession = Depends(get_async_session),
+    _admin: User = Depends(require_admin_section("admin.review", "admin.reported_questions")),
+):
+    """
+    Requirement 8: Updates question text, options, translations, passage, explanation, metadata in DB
+    and automatically sets Question status to PUBLISHED upon saving.
+    """
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Question with ID '{question_id}' not found.")
+
+    from app.cache import invalidate_question_cache
+    service = QuestionService(session)
+    res = await service.update_question_detail(question_id=qid_int, payload=payload)
+    await invalidate_question_cache(str(qid_int))
+    return res
+
+
+@router.patch("/{question_id}", response_model=QuestionDetailResponse, summary="Partial Update Question & Publish")
+async def patch_question(
+    question_id: int | str,
+    payload: QuestionUpdatePayload,
+    session: AsyncSession = Depends(get_async_session),
+    _admin: User = Depends(require_admin_section("admin.review", "admin.reported_questions")),
+):
+    """
+    Partially updates question text, options, translations, explanation, or metadata in DB
+    and automatically sets Question status to PUBLISHED upon saving.
+    """
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Question with ID '{question_id}' not found.")
+
+    from app.cache import invalidate_question_cache
+    service = QuestionService(session)
+    res = await service.update_question_detail(question_id=qid_int, payload=payload)
+    await invalidate_question_cache(str(qid_int))
+    return res
+
+
+@router.delete("/{question_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete Question")
+async def delete_question(
+    question_id: int | str,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_admin_section("admin.review", "admin.reported_questions")),
+):
+    """Deletes a question entity by ID. Admin/Super Admin only — permanently removes the question."""
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Question with ID '{question_id}' not found.")
+
+    from app.cache import invalidate_question_cache
+    service = QuestionService(session)
+    await service.delete_question(question_id=qid_int)
+    await invalidate_question_cache(str(qid_int))
+    return None
+
+
+@router.get("/{question_id}/formatted/yaml", response_class=PlainTextResponse, summary="Export Question to YAML", dependencies=[Depends(require_question_visible)])
+async def get_question_yaml_file(
+    question_id: int | str, session: AsyncSession = Depends(get_async_session)
+):
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Question with ID '{question_id}' not found.")
+    service = QuestionService(session)
+    return await service.get_question_yaml_file(qid_int)
+
+
+@router.get("/{question_id}/formatted/markdown", response_class=PlainTextResponse, summary="Export Question to Markdown", dependencies=[Depends(require_question_visible)])
+async def get_question_markdown_file(
+    question_id: int | str, session: AsyncSession = Depends(get_async_session)
+):
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Question with ID '{question_id}' not found.")
+    service = QuestionService(session)
+    return await service.get_question_markdown_file(qid_int)
+
+
+async def _explanation_in_language(session: AsyncSession, question_id: int, lang_code: "LanguageCode"):
+    """The question's explanation in lang_code, else English, else any language; None when there is none."""
+    from app.db.models import QuestionExplanation
+    from app.db.models.enums import LanguageCode
+    from sqlalchemy import case
+    from sqlmodel import select, col
+
+    preference = case(
+        (col(QuestionExplanation.language) == lang_code, 0),
+        (col(QuestionExplanation.language) == LanguageCode.ENGLISH, 1),
+        else_=2,
+    )
+    stmt = (
+        select(QuestionExplanation)
+        .where(col(QuestionExplanation.question_id) == question_id)
+        .order_by(preference, col(QuestionExplanation.id))
+        .limit(1)
+    )
+    return (await session.exec(stmt)).first()
+
+
+@router.get("/{question_id}/solution", summary="Get Full Solution & Distractor Analysis for a Question", dependencies=[Depends(require_question_visible)])
+async def get_question_solution(
+    question_id: int | str,
+    language: str = Query(default="en", description="Target Language"),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """
+    Optimized single-query fetch for question solution and distractor analyses
+    using exact database parameters available for Exam 10.
+    """
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail=f"Question with ID '{question_id}' not found.")
+
+    lang_code = parse_language(language)
+    from app.cache import get_cache, build_cache_key
+    from app.db.models import Question, QuestionOption, OptionTranslation, QuestionExplanation, QuestionOptionReasoning, LanguageCode
+    from app.engine.matrices.closeness_evaluator import ClosenessEvaluator
+    from sqlalchemy import select
+    from sqlmodel import col
+
+    cache = get_cache()
+    lang_str = lang_code.value
+    cache_key = build_cache_key("questions:solution", str(qid_int), lang_str)
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        detail = cached_data.get("explanation", {}).get("detailed_solution", "") if isinstance(cached_data, dict) else ""
+        if not detail or "evaluates core conceptual mastery" not in detail:
+            return JSONResponse(content=jsonable_encoder(cached_data))
+
+    # Single optimized SQL join query: fetches Question, Explanation, Options, Translations, and Distractor Reasonings
+    stmt = (
+        select(Question, QuestionExplanation, QuestionOption, OptionTranslation, QuestionOptionReasoning)
+        # One explanation row per question: the requested language (English/other fallback below)
+        .outerjoin(
+            QuestionExplanation,
+            (col(QuestionExplanation.question_id) == col(Question.id)) & (col(QuestionExplanation.language) == lang_code),
+        )
+        .join(QuestionOption, col(QuestionOption.question_id) == col(Question.id))
+        .outerjoin(OptionTranslation, col(OptionTranslation.option_id) == col(QuestionOption.id))
+        .outerjoin(QuestionOptionReasoning, col(QuestionOptionReasoning.question_option_id) == col(QuestionOption.id))
+        .where(col(Question.id) == qid_int, col(Question.status) != QuestionStatus.REJECTED)
+        .order_by(col(QuestionOption.display_order).asc())
+    )
+    rows = (await session.exec(stmt)).all()
+
+    if not rows:
+        # Fallback if question exists without options
+        q = await session.get(Question, qid_int)
+        if not q or q.status == QuestionStatus.REJECTED:
+            raise HTTPException(status_code=404, detail=f"Question with ID '{question_id}' not found.")
+        expl = await _explanation_in_language(session, q.id, lang_code)
+        sol_card = {
+            "question_id": str(q.id),
+            "question_number": q.question_number_in_paper,
+            "correct_option_id": None,
+            "correct_option_label": None,
+            "difficulty": q.difficulty.value if hasattr(q.difficulty, "value") else str(q.difficulty),
+            "explanation": {
+                "detailed_solution": expl.detailed_solution if expl else "",
+                "reverse_logic": expl.reverse_logic if expl else None,
+                "common_mistake": expl.common_mistake if expl else None,
+                "common_traps": (expl.common_traps_json or ([expl.common_mistake] if expl.common_mistake else [])) if expl else [],
+            },
+            "distractor_scores": {},
+            "source": "DATABASE_OPTIMIZED",
+        }
+        await cache.set(cache_key, sol_card, ttl_seconds=3600)
+        return JSONResponse(content=jsonable_encoder(sol_card))
+
+    q = rows[0][0]
+    expl = rows[0][1] or await _explanation_in_language(session, q.id, lang_code)
+
+    correct_option_id = None
+    correct_option_label = "A"
+    distractor_scores = {}
+
+    def _lang_rank(row) -> int:
+        return 0 if row.language == lang_code else (1 if row.language == LanguageCode.ENGLISH else 2)
+
+    opt_data = {}
+    for _, _, opt, ot, qr in rows:
+        if opt.id not in opt_data:
+            opt_data[opt.id] = {"opt": opt, "ots": [], "qr": qr}
+        if ot and all(o.id != ot.id for o in opt_data[opt.id]["ots"]):
+            opt_data[opt.id]["ots"].append(ot)
+        if qr and not opt_data[opt.id]["qr"]:
+            opt_data[opt.id]["qr"] = qr
+
+    # Collect full reverse logic source from explanation or option translations
+    full_rl_source = (expl.reverse_logic or "").strip() if expl else ""
+    if not full_rl_source and expl and expl.detailed_solution and ("Reverse Logic" in expl.detailed_solution or "Why the other options" in expl.detailed_solution):
+        full_rl_source = expl.detailed_solution
+    if not full_rl_source:
+        for entry in opt_data.values():
+            for o in entry["ots"]:
+                if o.distractor_analysis and ("Reverse Logic" in o.distractor_analysis or "Why the other options" in o.distractor_analysis or "Option (B)" in o.distractor_analysis or "रिवर्स लॉजिक" in o.distractor_analysis):
+                    full_rl_source = o.distractor_analysis
+                    break
+            if full_rl_source:
+                break
+
+    for opt_id, entry in opt_data.items():
+        opt = entry["opt"]
+        qr = entry["qr"]
+        # Option text and its analysis are chosen separately, each in the requested language, else
+        # English, else any: an option translated into Hindi before its analysis still shows one
+        ot = min(entry["ots"], key=_lang_rank, default=None)
+        analysed = [o for o in entry["ots"] if o.distractor_analysis and o.distractor_analysis.strip()]
+        analysis_row = min(analysed, key=_lang_rank, default=None)
+
+        analysis_text = None
+        if analysis_row:
+            analysis_text = analysis_row.distractor_analysis
+        elif qr:
+            why_t = (qr.why_tempting or "").strip()
+            whats_t = (qr.whats_actually_true or "").strip()
+            if why_t and whats_t:
+                analysis_text = f"Why it seems tempting — {why_t}\n\nWhat's actually true — {whats_t}"
+            elif whats_t:
+                analysis_text = whats_t
+            elif why_t:
+                analysis_text = why_t
+
+        if not analysis_text and not opt.is_correct and full_rl_source:
+            analysis_text = extract_option_analysis_from_text(full_rl_source, opt.option_label)
+
+        if opt.is_correct:
+            correct_option_id = str(opt.id)
+            correct_option_label = opt.option_label
+            if analysis_text:
+                analysis_text = clean_correct_option_text(analysis_text)
+
+        c_score = opt.closeness_score if opt.closeness_score is not None else (1.0 if opt.is_correct else 0.0)
+
+        distractor_scores[str(opt.id)] = {
+            "option_id": str(opt.id),
+            "label": opt.option_label,
+            "text": ot.option_text if ot else f"Option {opt.option_label}",
+            "closeness_score": c_score,
+            "is_correct": opt.is_correct,
+            "classification": "Correct Key" if opt.is_correct else (ClosenessEvaluator.classify_option(c_score) if (opt.closeness_score is not None and analysis_text) else "Distractor"),
+            "distractor_analysis": analysis_text or "",
+            "analysis": analysis_text or "",
+        }
+
+    detailed_solution = (
+        expl.detailed_solution.strip() if (expl and expl.detailed_solution and expl.detailed_solution.strip()) else ""
+    )
+
+    common_traps = (
+        expl.common_traps_json if (expl and expl.common_traps_json) else (
+            [expl.common_mistake] if (expl and expl.common_mistake) else []
+        )
+    )
+
+    sol_card = {
+        "question_id": str(q.id),
+        "question_number": q.question_number_in_paper,
+        "correct_option_id": correct_option_id,
+        "correct_option_label": correct_option_label,
+        "difficulty": q.difficulty.value if hasattr(q.difficulty, "value") else str(q.difficulty),
+        "explanation": {
+            "detailed_solution": detailed_solution,
+            "reverse_logic": expl.reverse_logic if expl else None,
+            "common_mistake": expl.common_mistake if expl else None,
+            "common_traps": common_traps,
+        },
+        "distractor_scores": distractor_scores,
+        "source": "DATABASE_OPTIMIZED",
+    }
+
+    await cache.set(cache_key, sol_card, ttl_seconds=3600)
+    return JSONResponse(content=jsonable_encoder(sol_card))
+
+

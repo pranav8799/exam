@@ -1,0 +1,443 @@
+import React from 'react';
+import { Clock, ChevronRight, Focus, Minimize2, SlidersHorizontal, Lightbulb, Globe } from 'lucide-react';
+import { useBreakpoint } from '../../hooks/useBreakpoint';
+import { getLanguageOption } from '../../constants/languages';
+import { useExamText } from '../../i18n/examText';
+
+interface ExamHeaderProps {
+  examTitle: string;
+  paperSubtitle: string;
+  timeLeft: number;
+  language: string;
+  isSubmitting?: boolean;
+  showSubmitButton?: boolean;
+  showTimer?: boolean;
+  topicName?: string;
+  subtopicName?: string;
+  parentBreadcrumb?: string;
+  onBack?: () => void;
+  onSubmitClick?: () => void;
+  focusMode?: boolean;
+  onToggleFocusMode?: () => void;
+  onFilterClick?: () => void;
+  onRecsClick?: () => void;
+  recsCount?: number;
+  /** The profile's secondary language; with onLanguageChange the badge switches English ⇄ it. */
+  secondaryLanguage?: string | null;
+  onLanguageChange?: (language: string) => void;
+}
+
+export function ExamHeader({
+  examTitle,
+  paperSubtitle,
+  timeLeft,
+  language,
+  isSubmitting = false,
+  showSubmitButton = true,
+  showTimer = true,
+  topicName,
+  subtopicName,
+  parentBreadcrumb,
+  onBack,
+  onSubmitClick,
+  focusMode = false,
+  onToggleFocusMode,
+  onFilterClick,
+  onRecsClick,
+  recsCount,
+  secondaryLanguage,
+  onLanguageChange,
+}: ExamHeaderProps) {
+  const isAuth = !!(localStorage.getItem('access_token') && localStorage.getItem('user'));
+  const rootBreadcrumb = parentBreadcrumb || (isAuth ? 'Dashboard' : 'Home');
+  const { isMobile, isTabletOrBelow } = useBreakpoint();
+  const { t } = useExamText();
+
+  // One height for every header control so the select, icon buttons and Submit line up
+  // (the touch-target class would otherwise stretch only the buttons to 44px).
+  const controlSize = isTabletOrBelow ? 36 : 34;
+  const controlBox = { height: controlSize, minHeight: controlSize, boxSizing: 'border-box' as const };
+
+  const isCriticalTime = timeLeft < 120; // < 2 mins
+  const isLowTime = timeLeft < 600; // < 10 mins
+
+  const timerColor = isCriticalTime ? 'var(--primary-red-border)' : isLowTime ? '#FDE68A' : 'var(--bg-card)';
+
+  const formatTime = (secs: number) => {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  };
+
+  return (
+    <header
+      className="exam-top-header"
+      style={{
+        height: 60,
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        zIndex: 100,
+        background: 'linear-gradient(90deg, var(--ink-black) 0%, var(--deep-navy) 100%)',
+        borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+        backdropFilter: 'blur(8px)',
+        WebkitBackdropFilter: 'blur(8px)',
+        boxShadow: '0 4px 20px rgba(15, 29, 56, 0.35)',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        padding: '0 clamp(12px, 3vw, 24px)',
+        boxSizing: 'border-box',
+        fontFamily: "'IBM Plex Sans', -apple-system, system-ui, sans-serif",
+      }}
+    >
+      {/* Left: Brand Logo & Paper Metadata */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'clamp(6px, 1.5vw, 12px)',
+          minWidth: 0,
+          flex: isMobile ? '0 0 auto' : 1,
+        }}
+      >
+        <img
+          src="/logo.jpeg"
+          alt="ExamPlanner"
+          style={{
+            width: 32,
+            height: 32,
+            objectFit: 'contain',
+            flexShrink: 0,
+          }}
+        />
+
+        {!isTabletOrBelow && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+            {/* Breadcrumb Trail */}
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                fontSize: 'clamp(12px, 2.5vw, 14px)',
+                color: 'rgba(255, 255, 255, 0.75)',
+                fontWeight: 500,
+                fontFamily: "'IBM Plex Sans', sans-serif",
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <button
+                type="button"
+                onClick={onBack}
+                className="touch-target"
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  padding: 0,
+                  color: 'rgba(255, 255, 255, 0.95)',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  fontSize: 'inherit',
+                  fontFamily: "'IBM Plex Sans', sans-serif",
+                  textDecoration: 'none',
+                  transition: 'opacity 0.2s ease',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.opacity = '0.7';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.opacity = '1';
+                }}
+                title={`Return to ${rootBreadcrumb}`}
+              >
+                {rootBreadcrumb}
+              </button>
+
+              {topicName && (
+                <>
+                  <ChevronRight size={13} color="rgba(255, 255, 255, 0.35)" />
+                  <span style={{ color: 'rgba(255, 255, 255, 0.9)', fontWeight: 600 }}>
+                    {topicName}
+                  </span>
+                </>
+              )}
+
+              {subtopicName && subtopicName !== 'Choose Subtopic' && subtopicName !== topicName && (
+                <>
+                  <ChevronRight size={13} color="rgba(255, 255, 255, 0.35)" />
+                  <span style={{ color: 'var(--primary-red)', fontWeight: 600 }}>{subtopicName}</span>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Center: Precision Clock Module */}
+      {showTimer && (
+        <div
+          className="exam-timer-center"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            borderRadius: 'var(--radius)',
+            backgroundColor: 'rgba(255, 255, 255, 0.07)',
+            border: '1px solid rgba(255, 255, 255, 0.14)',
+            boxShadow: 'inset 0 1px 2px rgba(0, 0, 0, 0.25), 0 4px 14px rgba(15, 29, 56, 0.3)',
+            backdropFilter: 'blur(4px)',
+            WebkitBackdropFilter: 'blur(4px)',
+            padding: '4px 10px',
+            // Phones: the timer is in normal flow; auto margins centre it between logo and controls
+            ...(isTabletOrBelow && { margin: '0 auto', flexShrink: 0 }),
+          }}
+        >
+          <Clock size={14} color={timerColor} />
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+            {!isTabletOrBelow && (
+              <span
+                style={{
+                  fontSize: 8,
+                  color: 'rgba(255, 255, 255, 0.55)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.1em',
+                  fontWeight: 700,
+                  lineHeight: 1,
+                }}
+              >
+                {t('timeRemaining')}
+              </span>
+            )}
+            <span
+              style={{
+                fontSize: 'clamp(13px, 2.5vw, 15.5px)',
+                fontWeight: 800,
+                color: timerColor,
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                fontVariantNumeric: 'tabular-nums',
+                letterSpacing: '0.04em',
+              }}
+            >
+              {formatTime(timeLeft)}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Right: Controls & Language Selector & Submit CTA */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'clamp(6px, 1.2vw, 10px)',
+          flex: isTabletOrBelow ? '0 0 auto' : 1,
+          justifyContent: 'flex-end',
+          minWidth: 0,
+        }}
+      >
+        {/* The session's language: English (primary), switchable to the profile's secondary language */}
+        {secondaryLanguage && secondaryLanguage !== 'en' && onLanguageChange ? (
+          <div
+            data-testid="exam-language"
+            role="radiogroup"
+            aria-label="Question language"
+            style={{
+              display: 'flex',
+              alignItems: 'stretch',
+              padding: 2,
+              gap: 2,
+              backgroundColor: 'rgba(255, 255, 255, 0.08)',
+              border: '1px solid rgba(255, 255, 255, 0.22)',
+              borderRadius: 'var(--radius)',
+              ...controlBox,
+              flexShrink: 0,
+            }}
+          >
+            {['en', secondaryLanguage].map((code) => {
+              const option = getLanguageOption(code);
+              const active = language === code;
+              return (
+                <button
+                  key={code}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  data-testid={`exam-language-${code}`}
+                  onClick={() => !active && onLanguageChange(code)}
+                  title={`Show questions in ${option.name}`}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    padding: '0 8px',
+                    border: 'none',
+                    borderRadius: 'calc(var(--radius) - 1px)',
+                    backgroundColor: active ? 'var(--bg-card)' : 'transparent',
+                    color: active ? 'var(--deep-navy)' : 'rgba(255, 255, 255, 0.85)',
+                    fontSize: 'clamp(11px, 2vw, 12.5px)',
+                    fontWeight: 700,
+                    fontFamily: "'IBM Plex Sans', sans-serif",
+                    cursor: active ? 'default' : 'pointer',
+                    transition: 'all 0.15s ease',
+                  }}
+                >
+                  {code === 'en' && !isMobile && <Globe size={13} style={{ flexShrink: 0 }} />}
+                  {/* Phones only have room for a short label */}
+                  <span>{code === 'en' ? (isMobile ? 'EN' : option.name) : option.nativeName}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div
+            data-testid="exam-language"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 5,
+              backgroundColor: 'rgba(255, 255, 255, 0.08)',
+              border: '1px solid rgba(255, 255, 255, 0.22)',
+              borderRadius: 'var(--radius)',
+              padding: '0 8px',
+              ...controlBox,
+              color: 'var(--bg-card)',
+              flexShrink: 0,
+              fontSize: 'clamp(11px, 2vw, 12.5px)',
+              fontWeight: 600,
+              fontFamily: "'IBM Plex Sans', sans-serif",
+            }}
+            title={onLanguageChange ? 'Set a secondary language in your Profile to switch languages here.' : 'Language for this session.'}
+          >
+            {!isMobile && <Globe size={14} style={{ color: 'rgba(255, 255, 255, 0.7)', flexShrink: 0 }} />}
+            {/* Phones only have room for the short native name */}
+            <span>{isMobile ? getLanguageOption(language).nativeName : `${getLanguageOption(language).nativeName} (${getLanguageOption(language).name})`}</span>
+          </div>
+        )}
+        {isTabletOrBelow && onFilterClick && (
+          <button
+            type="button"
+            onClick={onFilterClick}
+            className="touch-target"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: controlSize,
+              minWidth: controlSize,
+              ...controlBox,
+              borderRadius: 'var(--radius)',
+              border: '1px solid rgba(255, 255, 255, 0.25)',
+              backgroundColor: 'rgba(255, 255, 255, 0.09)',
+              color: 'var(--bg-card)',
+              cursor: 'pointer',
+              flexShrink: 0,
+              transition: 'all 0.15s ease',
+            }}
+            title="Filters"
+            aria-label="Show filters"
+          >
+            <SlidersHorizontal size={15} />
+          </button>
+        )}
+        {isTabletOrBelow && onRecsClick && (
+          <button
+            type="button"
+            onClick={onRecsClick}
+            className="touch-target"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 3,
+              width: recsCount ? 'auto' : controlSize,
+              minWidth: controlSize,
+              ...controlBox,
+              padding: recsCount ? '0 8px' : 0,
+              borderRadius: 'var(--radius)',
+              border: '1px solid rgba(255, 255, 255, 0.25)',
+              backgroundColor: 'rgba(255, 255, 255, 0.09)',
+              color: 'var(--bg-card)',
+              cursor: 'pointer',
+              flexShrink: 0,
+              fontSize: 11.5,
+              fontWeight: 700,
+              transition: 'all 0.15s ease',
+            }}
+            title="Recommended Questions"
+            aria-label="Show recommended questions"
+          >
+            <Lightbulb size={15} />
+            {!!recsCount && <span>{recsCount}</span>}
+          </button>
+        )}
+        {onToggleFocusMode && (
+          <button
+            type="button"
+            onClick={onToggleFocusMode}
+            className="touch-target"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 6,
+              padding: '0 10px',
+              minWidth: controlSize,
+              ...controlBox,
+              borderRadius: 'var(--radius)',
+              border: `1px solid ${focusMode ? 'rgba(var(--primary-red-rgb), 0.5)' : 'rgba(255, 255, 255, 0.25)'}`,
+              backgroundColor: focusMode ? 'rgba(var(--primary-red-rgb), 0.18)' : 'rgba(255, 255, 255, 0.09)',
+              color: 'var(--bg-card)',
+              fontSize: 'clamp(11.5px, 2.5vw, 12.5px)',
+              fontWeight: 600,
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+              transition: 'all 0.15s ease',
+            }}
+            title={focusMode ? t('exitFullScreen') : t('enterFullScreen')}
+          >
+            {focusMode ? <Minimize2 size={13} /> : <Focus size={13} />}
+            {!isTabletOrBelow && <span>{focusMode ? t('exitFocus') : t('fullScreen')}</span>}
+          </button>
+        )}
+        {showSubmitButton && onSubmitClick && (
+          <button
+            type="button"
+            onClick={onSubmitClick}
+            disabled={isSubmitting}
+            className="touch-target"
+            style={{
+              padding: isMobile ? '0 12px' : '0 14px',
+              ...controlBox,
+              flexShrink: 0,
+              borderRadius: 'var(--radius)',
+              border: '1px solid rgba(255, 255, 255, 0.25)',
+              backgroundColor: 'rgba(255, 255, 255, 0.09)',
+              color: 'var(--bg-card)',
+              fontSize: 'clamp(11.5px, 2.5vw, 12.5px)',
+              fontWeight: 600,
+              cursor: isSubmitting ? 'not-allowed' : 'pointer',
+              opacity: isSubmitting ? 0.6 : 1,
+              transition: 'all 0.15s ease',
+              whiteSpace: 'nowrap',
+            }}
+            onMouseEnter={(e) => {
+              if (!isSubmitting)
+                e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.18)';
+            }}
+            onMouseLeave={(e) => {
+              if (!isSubmitting)
+                e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.09)';
+            }}
+          >
+            {isSubmitting ? t('submitting') : isMobile ? t('submit') : t('submitTest')}
+          </button>
+        )}
+      </div>
+    </header>
+  );
+}

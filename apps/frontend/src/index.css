@@ -1,0 +1,1025 @@
+/* ═══════════════════════════════════════════════════════════════
+   Global CSS — ExamPlanner
+   ═══════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=DM+Mono:wght@300;400;500&display=swap');
+
+/* ── 1. Design Tokens ── */
+:root {
+  /* Strict User Requested Palette */
+  --primary-red: #e31b23;
+  --primary-red-rgb: 227, 27, 35;
+  --deep-navy: #172033;
+  --ink-black: #111111;
+  --soft-white: #f8fafc;
+  --success-green: #3a8b53;
+  --info-teal: #199eae;
+  --warning-yellow: #f2b623;
+  --orange: #f47b35;
+
+  /* Theme System Mappings */
+  --background: var(--soft-white);
+  --foreground: var(--ink-black);
+
+  --bg-card: #ffffff;
+  --bg-secondary: #f1f5f9;
+
+  --text-main: var(--ink-black);
+  --text-muted: #64748b;
+
+  --border-color: #e2e8f0;
+
+  /* Fonts */
+  --font-display: 'Outfit', sans-serif;
+  --font-body: 'DM Sans', sans-serif;
+  --font-mono: 'DM Mono', monospace;
+
+  /* ── Fluid Spacing Scale (4px base, scales down on mobile) ── */
+  --space-1: clamp(2px, 0.25vw + 1px, 4px);
+  --space-2: clamp(4px, 0.5vw + 2px, 8px);
+  --space-3: clamp(8px, 0.75vw + 4px, 12px);
+  --space-4: clamp(12px, 1vw + 4px, 16px);
+  --space-5: clamp(14px, 1.25vw + 4px, 20px);
+  --space-6: clamp(16px, 1.5vw + 4px, 24px);
+  --space-7: clamp(20px, 2vw + 4px, 32px);
+  --space-8: clamp(24px, 2.5vw + 4px, 40px);
+  --space-9: clamp(28px, 3vw + 4px, 48px);
+  --space-10: clamp(32px, 4vw + 4px, 64px);
+  --space-12: clamp(40px, 5vw + 8px, 80px);
+
+  /* ── Fluid Typography Scale ── */
+  --text-xs: clamp(0.6875rem, 0.65rem + 0.15vw, 0.75rem); /* 11–12px */
+  --text-sm: clamp(0.75rem, 0.7rem + 0.2vw, 0.875rem); /* 12–14px */
+  --text-base: clamp(0.8125rem, 0.75rem + 0.25vw, 1rem); /* 13–16px */
+  --text-lg: clamp(1rem, 0.9rem + 0.35vw, 1.125rem); /* 16–18px */
+  --text-xl: clamp(1.125rem, 1rem + 0.5vw, 1.5rem); /* 18–24px */
+  --text-2xl: clamp(1.375rem, 1.1rem + 0.8vw, 1.875rem); /* 22–30px */
+  --text-3xl: clamp(1.625rem, 1.2rem + 1.2vw, 2.5rem); /* 26–40px */
+  --text-4xl: clamp(2rem, 1.5rem + 1.5vw, 3.125rem); /* 32–50px */
+
+  /* ── Layout Variables ── */
+  --sidebar-width: 240px;
+  --sidebar-collapsed-width: 68px;
+  --header-height: 60px;
+  --footer-height: 64px;
+  --content-max-width: 1360px;
+  --content-padding: clamp(12px, 3vw, 36px);
+
+  /* Other constants */
+  --radius: 8px;
+  --shadow-sm: 0 1px 2px rgba(17, 17, 17, 0.05);
+  --shadow-md: 0 4px 12px rgba(17, 17, 17, 0.06);
+}
+
+.dark {
+  --background: var(--ink-black);
+  --foreground: var(--soft-white);
+  --bg-card: var(--deep-navy);
+  --bg-secondary: #1e293b;
+  --text-main: var(--soft-white);
+  --text-muted: #94a3b8;
+  --border-color: rgba(255, 255, 255, 0.12);
+}
+
+/* ── 2. Reset & Base ── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+button,
+input,
+select,
+textarea,
+.card,
+[class*="card"],
+[class*="btn"],
+[class*="badge"] {
+  border-radius: var(--radius);
+}
+
+/* Structural / full-bleed chrome stays sharp even though --radius now rounds cards & buttons:
+   - Landing-page sections sit back-to-back with their own solid background, so a radius here
+     shows as a white gap at the seam between stacked sections.
+   - Sidebars, headers, navbars, and footers are edge-to-edge navigation chrome, not content cards.
+   - Table rows/cells (e.g. a shaded <thead> row) sit flush against their table siblings, so a
+     radius there shows the same gap artifact as the landing sections.
+   Higher selector specificity than the `*` reset above wins regardless of source order. */
+.landing-page > section {
+  border-radius: 0 !important;
+}
+
+aside,
+header,
+nav,
+footer,
+thead,
+tbody,
+tr,
+th,
+td {
+  border-radius: 0 !important;
+}
+
+/* Cards, panels and inputs that draw a border or shadow inline but never set a radius (so they
+   were square). :where() keeps specificity at zero: any explicit radius — inline (e.g. 50% for
+   avatars) or from a class — still wins. Table parts and app chrome stay square (see below). */
+:where(
+  [style*="border: 1px"]:not(table, thead, tbody, tr, th, td, aside, header, nav, footer),
+  [style*="border: 1.5px"]:not(table, thead, tbody, tr, th, td, aside, header, nav, footer),
+  [style*="box-shadow"]:not(table, thead, tbody, tr, th, td, aside, header, nav, footer)
+) {
+  border-radius: var(--radius);
+}
+
+/* Grid items default to min-width:auto, so one wide child (a table, a long word) stretches its whole
+   track past the screen. Let grid items shrink; an explicit min-width in inline styles still wins. */
+:where([style*="display: grid"]) > * {
+  min-width: 0;
+}
+
+/* Small screens: a table that does not fit scrolls sideways inside its card instead of being cut
+   off. !important is needed to beat the inline `overflow: hidden` used for rounded corners. */
+@media (max-width: 900px) {
+  :where(div, section, article):has(> table),
+  :where(div, section, article):has(> div > table) {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+  }
+  main table {
+    min-width: 560px;
+  }
+}
+
+/* Tables: rows/cells stay square, but the table and its wrapper round and clip so the
+   shaded header row follows the rounded corners. */
+table {
+  border-radius: var(--radius);
+}
+
+:where(div, section, article):has(> table),
+:where(div, section, article):has(> div > table) {
+  border-radius: var(--radius);
+  overflow: clip;
+}
+
+html {
+  /* Ensure text scaling works at 200% zoom */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  /* Don't disable pinch-to-zoom */
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family:
+    'Plus Jakarta Sans',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  overflow-x: hidden;
+  /* `clip` keeps the horizontal cut-off without turning body into a scroll container, which on
+     iOS Safari makes position:fixed chrome (admin sidebar) scroll with the page. */
+  overflow-x: clip;
+  -webkit-font-smoothing: antialiased;
+  /* Use dynamic viewport height to handle mobile browser chrome */
+  min-height: 100dvh;
+}
+
+/* ── 3. Custom Scrollbar ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--text-muted);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--foreground);
+}
+
+/* ── 4. Responsive Utility Classes ── */
+
+/* Visibility helpers — mobile-first (default hidden, show at breakpoint) */
+.flex {
+  display: flex;
+}
+.flex-col {
+  flex-direction: column;
+}
+.grid {
+  display: grid;
+}
+.hidden {
+  display: none;
+}
+.gap-4 {
+  gap: 1rem;
+}
+.gap-5 {
+  gap: 1.25rem;
+}
+.gap-6 {
+  gap: 1.5rem;
+}
+.grid-cols-1 {
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+}
+.grid-cols-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.max-w-none {
+  max-width: none;
+}
+
+/* Show/hide at breakpoints */
+.show-mobile-only {
+  display: block;
+}
+.show-tablet-up {
+  display: none;
+}
+.show-desktop-up {
+  display: none;
+}
+.hide-mobile {
+  display: none;
+}
+
+/* Touch target utility — min 44×44px interactive area */
+.touch-target {
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Responsive grid that adapts to container width */
+.responsive-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: var(--space-5);
+}
+
+/* Stack items vertically on mobile, row on tablet+ */
+.stack-on-mobile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* Full-screen mobile overlay pattern */
+.mobile-full-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: var(--bg-card);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: var(--space-4);
+  padding-top: calc(var(--header-height) + var(--space-4));
+  /* Safe area insets for notched devices */
+  padding-left: max(var(--space-4), env(safe-area-inset-left));
+  padding-right: max(var(--space-4), env(safe-area-inset-right));
+  padding-bottom: max(var(--space-6), env(safe-area-inset-bottom));
+}
+
+/* Horizontal scroll container with snap (for carousels on mobile) */
+.horizontal-scroll-snap {
+  display: flex;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none; /* Firefox */
+  gap: var(--space-4);
+  padding-bottom: var(--space-2);
+}
+.horizontal-scroll-snap::-webkit-scrollbar {
+  display: none;
+}
+.horizontal-scroll-snap > * {
+  scroll-snap-align: start;
+  flex-shrink: 0;
+}
+
+/* ── 5. Breakpoint Media Queries ── */
+
+/* sm: 391px+ (large phones) */
+@media (min-width: 391px) {
+  .show-sm-up {
+    display: block;
+  }
+  .hide-sm-up {
+    display: none;
+  }
+}
+
+/* md: 481px+ (phablets) */
+@media (min-width: 481px) {
+  .hide-mobile {
+    display: block;
+  }
+  .stack-on-mobile {
+    flex-direction: row;
+  }
+}
+
+/* tablet: 640px+ */
+@media (min-width: 640px) {
+  .show-tablet-up {
+    display: block;
+  }
+  .show-tablet-up-flex {
+    display: flex;
+  }
+  .hide-tablet-up {
+    display: none;
+  }
+}
+
+/* md (old): 768px+ — keep for backward compat */
+@media (min-width: 768px) {
+  .md\:flex {
+    display: flex !important;
+  }
+  .md\:hidden {
+    display: none !important;
+  }
+  .md\:grid-cols-2 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .show-mobile-only {
+    display: none;
+  }
+}
+
+/* lg: 835px+ (tablets landscape) */
+@media (min-width: 835px) {
+  .show-lg-up {
+    display: block;
+  }
+  .show-lg-up-flex {
+    display: flex;
+  }
+  .hide-lg-up {
+    display: none;
+  }
+}
+
+/* desktop: 1024px+ (small laptops) */
+@media (min-width: 1024px) {
+  .lg\:flex {
+    display: flex !important;
+  }
+  .lg\:hidden {
+    display: none !important;
+  }
+  .lg\:grid-cols-3 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .lg\:grid-cols-4 {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .lg\:gap-4 {
+    gap: 1rem;
+  }
+  .lg\:gap-6 {
+    gap: 1.5rem;
+  }
+  .show-desktop-up {
+    display: block;
+  }
+  .show-desktop-up-flex {
+    display: flex;
+  }
+  .hide-desktop {
+    display: none;
+  }
+}
+
+/* xl: 1367px+ */
+@media (min-width: 1367px) {
+  .show-xl-up {
+    display: block;
+  }
+  .hide-xl-up {
+    display: none;
+  }
+}
+
+/* ── 6. Touch & Pointer Queries ── */
+@media (pointer: coarse) {
+  /* On touch devices, ensure min 44px touch targets for interactive elements */
+  button,
+  a,
+  select,
+  [role='button'] {
+    min-height: 44px;
+  }
+
+  /* Remove hover-dependent visual effects on touch devices */
+  .hover-only {
+    display: none;
+  }
+}
+
+@media (hover: hover) and (pointer: fine) {
+  /* Desktop hover effects — only on devices that support hover */
+  .hover-lift:hover {
+    transform: translateY(-2px);
+  }
+  .hover-glow:hover {
+    box-shadow: var(--shadow-md);
+  }
+}
+
+/* ── 7. Accessibility: Reduced Motion ── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── 8. Safe Area Insets ── */
+/* For fixed/sticky elements that might be obscured by notches or home indicators */
+.safe-area-bottom {
+  padding-bottom: max(var(--space-4), env(safe-area-inset-bottom));
+}
+.safe-area-top {
+  padding-top: max(0px, env(safe-area-inset-top));
+}
+.safe-area-left {
+  padding-left: max(0px, env(safe-area-inset-left));
+}
+.safe-area-right {
+  padding-right: max(0px, env(safe-area-inset-right));
+}
+
+/* ── 9. Landscape Phone Override ── */
+/* Short + wide viewport — typically landscape phone */
+@media (max-height: 500px) and (orientation: landscape) {
+  :root {
+    --header-height: 48px;
+    --footer-height: 52px;
+  }
+}
+
+/* ── 10. Glass Panel ── */
+.glass-panel {
+  background: var(--bg-card);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-color);
+}
+
+.transition-layout {
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ── 11. Focus Visible Styles ── */
+:focus-visible {
+  outline: 2px solid var(--primary-red);
+  outline-offset: 2px;
+}
+
+/* ── 12. Responsive Student Layout Classes ── */
+.student-layout-root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  background-color: #f8fafc;
+  font-family:
+    'Plus Jakarta Sans',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  color: #172033;
+  overflow-x: hidden;
+}
+
+.student-main-container {
+  display: flex;
+  flex: 1;
+  margin-top: var(--header-height);
+}
+
+.student-content-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  width: 100%;
+  transition: margin-left 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  margin-left: 0;
+}
+
+.student-content-main {
+  padding: var(--content-padding);
+  max-width: var(--content-max-width);
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Pages that opt in with data-page-align="left" (Announcements, Current Affairs, Bookmarks) hug the sidebar
+   instead of being centred in the leftover width on wide screens. */
+.student-content-main:has(> [data-page-align="left"]) {
+  margin-left: 0;
+}
+
+/* Desktop: account for sidebar (breakpoint matches useBreakpoint's isTabletOrBelow, ≤834) */
+@media (min-width: 835px) {
+  .student-content-area {
+    margin-left: var(--sidebar-width);
+  }
+  .student-content-area.sidebar-collapsed {
+    margin-left: var(--sidebar-collapsed-width);
+  }
+}
+
+/* ── 13. Responsive Sidebar Classes ── */
+.app-sidebar {
+  width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
+  background: #172033;
+  display: flex;
+  flex-direction: column;
+  height: calc(100dvh - var(--header-height));
+  position: fixed;
+  top: var(--header-height);
+  left: 0;
+  bottom: 0;
+  z-index: 120;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  transition:
+    transform 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+    width 0.2s ease,
+    min-width 0.2s ease;
+}
+
+.app-sidebar.collapsed {
+  width: var(--sidebar-collapsed-width);
+  min-width: var(--sidebar-collapsed-width);
+}
+
+/* Mobile/tablet sidebar: slide-in drawer (≤834 = useBreakpoint's isTabletOrBelow) */
+@media (max-width: 834px) {
+  .app-sidebar {
+    width: 280px;
+    min-width: 280px;
+    transform: translateX(-100%);
+  }
+  .app-sidebar.mobile-open {
+    transform: translateX(0);
+  }
+}
+
+/* ── 14. Responsive Top Header Classes ── */
+.app-top-header {
+  height: var(--header-height);
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  z-index: 100;
+  background: #172033;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 4px 20px rgba(17, 17, 17, 0.25);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 var(--space-6);
+  box-sizing: border-box;
+}
+
+@media (max-width: 768px) {
+  .app-top-header {
+    padding: 0 var(--space-4);
+  }
+}
+
+/* ── 15. Sidebar Overlay Backdrop ── */
+.sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  top: var(--header-height);
+  background: rgba(23, 32, 51, 0.75);
+  backdrop-filter: blur(2px);
+  z-index: 110;
+  animation: fadeIn 0.2s ease-out;
+}
+
+/* ── 16. Popover / Dropdown Responsive ── */
+.popover-panel {
+  position: absolute;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12);
+  z-index: 200;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* On mobile, popovers become near-full-width */
+@media (max-width: 480px) {
+  .popover-panel {
+    position: fixed;
+    left: var(--space-3) !important;
+    right: var(--space-3) !important;
+    top: auto !important;
+    bottom: 0 !important;
+    max-height: 70vh;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    width: auto !important;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
+}
+
+/* ── 17. Auth Modal Responsive ── */
+.auth-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  padding: 24px 16px;
+  font-family:
+    'Plus Jakarta Sans',
+    -apple-system,
+    system-ui,
+    sans-serif;
+}
+
+.auth-modal-card {
+  background: #ffffff;
+  padding: 36px 32px 32px 32px;
+  width: 100%;
+  max-width: 420px;
+  max-height: 90vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  box-shadow:
+    0 20px 40px -15px rgba(23, 37, 84, 0.12),
+    0 0 0 1px rgba(226, 232, 240, 0.8);
+  position: relative;
+  border: 1px solid #e2e8f0;
+  box-sizing: border-box;
+}
+
+/* Full-screen auth modal on small phones */
+@media (max-width: 480px) {
+  .auth-modal-overlay {
+    padding: 0;
+    align-items: stretch;
+  }
+  .auth-modal-card {
+    max-width: 100%;
+    max-height: 100%;
+    height: 100%;
+    padding: 24px 20px;
+    padding-top: max(24px, env(safe-area-inset-top));
+    padding-bottom: max(24px, env(safe-area-inset-bottom));
+  }
+}
+
+/* ── 18. Exam Layout Responsive ── */
+.exam-layout-main {
+  display: flex;
+  gap: 0;
+  margin-top: var(--header-height);
+  margin-bottom: var(--footer-height);
+  min-height: calc(100dvh - var(--header-height) - var(--footer-height));
+}
+
+.exam-question-area {
+  flex: 1;
+  min-width: 0;
+  padding: var(--content-padding);
+}
+
+.exam-palette-sidebar {
+  width: 100%;
+  flex-shrink: 0;
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+}
+
+/* Above the tablet breakpoint, the question card and palette render side by
+   side (see ExamEnginePage's isTabletOrBelow gating), so the palette becomes
+   a fixed-width sidebar instead of taking the full row. */
+@media (min-width: 835px) {
+  .exam-palette-sidebar {
+    width: 300px;
+    margin-right: 24px;
+  }
+}
+
+/* Exam palette as full-screen overlay on mobile */
+.exam-palette-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: #ffffff;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: var(--space-4);
+  padding-top: calc(var(--header-height) + var(--space-4));
+  padding-bottom: max(var(--space-6), env(safe-area-inset-bottom));
+  animation: slideUpOverlay 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideUpOverlay {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.shimmer-block {
+  background: linear-gradient(90deg, #EEF1F4 25%, #F8FAFC 50%, #EEF1F4 75%);
+  background-size: 200% 100%;
+  animation: shimmerSweep 1.4s ease-in-out infinite;
+  border-radius: 4px;
+}
+
+@keyframes shimmerSweep {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.spin-loader {
+  animation: spinLoader 0.8s linear infinite;
+}
+
+@keyframes spinLoader {
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+/* Unified Spinner ring — used by <Spinner /> component */
+@keyframes spin-ring {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── 19. Exam Footer Responsive ── */
+.exam-footer-bar.has-confidence-row {
+  /* Two stacked rows: size to content with breathing room above the first row */
+  height: auto;
+  min-height: calc(var(--footer-height) + 44px);
+  flex-wrap: wrap;
+  align-content: center;
+  row-gap: 8px;
+  padding-top: 10px;
+  padding-bottom: max(10px, env(safe-area-inset-bottom));
+}
+
+.exam-footer-confidence-row {
+  order: -1;
+  width: 100%;
+  display: flex;
+  justify-content: center;
+}
+
+.exam-footer-bar {
+  height: var(--footer-height);
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: #ffffff;
+  border-top: 1px solid #e2e8f0;
+  box-shadow: 0 -2px 10px rgba(15, 23, 42, 0.04);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 var(--space-7);
+  box-sizing: border-box;
+  padding-bottom: max(0px, env(safe-area-inset-bottom));
+}
+
+@media (max-width: 640px) {
+  .exam-footer-bar {
+    padding: 0 var(--space-3);
+    padding-bottom: max(0px, env(safe-area-inset-bottom));
+  }
+}
+
+/* ── 20. Exam Header Responsive ── */
+.exam-top-header {
+  height: var(--header-height);
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: linear-gradient(90deg, #111111 0%, #172033 100%);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 4px 20px rgba(15, 29, 56, 0.35);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 var(--space-6);
+  box-sizing: border-box;
+}
+
+@media (max-width: 768px) {
+  .exam-top-header {
+    padding: 0 var(--space-3);
+  }
+}
+
+/* Timer centering — on small screens, flow with the header instead of absolute positioning */
+.exam-timer-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 22px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.25),
+    0 4px 14px rgba(15, 29, 56, 0.3);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+@media (max-width: 768px) {
+  .exam-timer-center {
+    position: static;
+    transform: none;
+    padding: 4px 12px;
+  }
+}
+
+/* ── 21. Keyboard Trap Utility ── */
+.scroll-lock {
+  overflow: hidden !important;
+  touch-action: none;
+}
+
+/* ── 22. Universal Sleek Scrollbars & no-scrollbar ── */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.6);
+}
+
+.no-scrollbar {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none !important;
+}
+
+/* ── 23. Text Alignment & Border Clipping Containment ── */
+button,
+input,
+select,
+textarea {
+  box-sizing: border-box;
+}
+
+.center-content {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+/* ── 21. Mobile Drawer Navigation ── */
+.mobile-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  top: var(--header-height);
+  background: rgba(15, 23, 42, 0.4);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 90;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.mobile-drawer-content {
+  position: fixed;
+  top: var(--header-height);
+  left: 0;
+  right: 0;
+  background: var(--bg-card);
+  padding: 24px;
+  z-index: 95;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12);
+  border-bottom: 1px solid var(--border-color);
+  animation: slideDown 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  max-height: calc(100vh - var(--header-height));
+  overflow-y: auto;
+}
+
+@keyframes slideDown {
+  from { transform: translateY(-10px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ── 24. Notification Slide-Out & Checked-Up Animations ── */
+@keyframes notifSlideOut {
+  0% {
+    transform: translateX(0);
+    opacity: 1;
+    max-height: 120px;
+    margin-bottom: 8px;
+  }
+  40% {
+    transform: translateX(110%);
+    opacity: 0.2;
+    max-height: 120px;
+    margin-bottom: 8px;
+  }
+  100% {
+    transform: translateX(120%);
+    opacity: 0;
+    max-height: 0;
+    margin-bottom: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top-width: 0;
+    border-bottom-width: 0;
+    overflow: hidden;
+  }
+}
+
+.notif-item-sliding-out {
+  animation: notifSlideOut 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  pointer-events: none;
+  overflow: hidden;
+  will-change: transform, opacity, max-height;
+}
+
+@keyframes checkedUpPopIn {
+  0% {
+    opacity: 0;
+    transform: scale(0.9) translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.notif-checked-up-state {
+  animation: checkedUpPopIn 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+
+.animate-spin {
+  animation: spinLoader 1s linear infinite;
+}
+

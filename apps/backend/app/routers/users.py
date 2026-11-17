@@ -1,0 +1,394 @@
+from typing import Annotated, List, Optional
+from fastapi import APIRouter, Depends, Query, status, HTTPException, Response, Request
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
+from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlmodel import select, col, and_, func
+
+from app.db.session import get_async_session
+from app.schemas.user import StaffCreate, StaffCreateOut, UserRead, UserUpdate
+from app.services.user_service import UserService
+from app.db.models.user import User, UserRole, QuestionBookmark
+from app.db.models.question import Question, QuestionTranslation
+from app.db.models.enums import DifficultyLevel, LanguageCode
+from app.db.models.hierarchy import Exam
+from app.core.deps import get_current_user, require_roles, require_admin_section
+from app.cache import get_cache, build_cache_key, invalidate_user_cache
+from app.services import audit_service
+
+router = APIRouter(prefix="/users", tags=["Users"])
+
+
+@router.get("/me/bookmarks")
+async def list_bookmarks(
+    response: Response,
+    skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 10,
+    q: Annotated[Optional[str], Query(max_length=200, description="Search in the question text")] = None,
+    difficulty: Optional[DifficultyLevel] = None,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(get_current_user),
+):
+    """One page of the user's bookmarks, newest first, with the total that matches the filters."""
+    # The student edits this list (removing re-fetches the page), so the browser must not reuse a stale copy;
+    # the server-side cache below is cleared on every add/remove.
+    response.headers["Cache-Control"] = "private, no-cache"
+    if not current_user.id:
+        return {"items": [], "total": 0}
+
+    search = (q or "").strip()
+    cache = get_cache()
+    cache_key = build_cache_key(
+        "users:bookmarks",
+        str(current_user.id),
+        "page-v2",  # v2 items carry exam/year; keeps them apart from older cached shapes
+        skip=skip,
+        limit=limit,
+        q=search.lower(),
+        difficulty=difficulty.value if difficulty else None,
+    )
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
+
+    filters = [col(QuestionBookmark.user_id) == current_user.id]
+    if difficulty:
+        filters.append(col(Question.difficulty) == difficulty)
+    if search:
+        escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        filters.append(col(QuestionTranslation.question_text).ilike(f"%{escaped}%", escape="\\"))
+
+    english_text = and_(
+        col(QuestionTranslation.question_id) == col(Question.id),
+        col(QuestionTranslation.language) == LanguageCode.ENGLISH,
+    )
+
+    total_stmt = (
+        select(func.count(col(QuestionBookmark.id)))
+        .join(Question, col(QuestionBookmark.question_id) == col(Question.id))
+        .join(QuestionTranslation, english_text, isouter=True)
+        .where(*filters)
+    )
+    total = (await session.exec(total_stmt)).one()
+
+    # Single-pass optimized query selecting only needed scalar columns
+    stmt = (
+        select(
+            col(QuestionBookmark.id).label("bookmark_id"),
+            col(Question.id).label("question_id"),
+            col(Question.difficulty),
+            col(QuestionBookmark.created_at),
+            func.coalesce(col(QuestionTranslation.question_text), "").label("question_text"),
+            col(Question.source_year).label("question_year"),
+            col(Exam.name).label("exam_full_name"),
+            col(Exam.source_year).label("exam_year"),
+            col(Exam.is_mixed_bank),
+        )
+        .join(Question, col(QuestionBookmark.question_id) == col(Question.id))
+        .join(QuestionTranslation, english_text, isouter=True)
+        .join(Exam, col(Question.exam_id) == col(Exam.id), isouter=True)
+        .where(*filters)
+        .order_by(col(QuestionBookmark.created_at).desc(), col(QuestionBookmark.id).desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    result = await session.exec(stmt)
+    rows = result.all()
+
+    from app.services.exam_session_service import exam_badge_label, load_exam_type_codes
+    type_codes = await load_exam_type_codes(session) if any(row.exam_full_name for row in rows) else set()
+
+    items = []
+    for row in rows:
+        difficulty_raw = getattr(row, "difficulty", None)
+        diff_val = difficulty_raw.value if hasattr(difficulty_raw, "value") else (difficulty_raw or "MEDIUM")
+        # A mixed bank's own year is a placeholder; its questions carry their real year.
+        year = row.question_year or (None if row.is_mixed_bank else row.exam_year)
+        items.append({
+            "bookmark_id": str(getattr(row, "bookmark_id", "")),
+            "question_id": str(getattr(row, "question_id", "")),
+            "question_text": getattr(row, "question_text", "") or "",
+            "difficulty": diff_val,
+            "created_at": row.created_at.isoformat() if getattr(row, "created_at", None) else None,
+            "exam_name": exam_badge_label(row.exam_full_name, type_codes),
+            "exam_full_name": row.exam_full_name,
+            "source_year": year,
+        })
+
+    out = {"items": items, "total": int(total or 0)}
+    await cache.set(cache_key, out, ttl_seconds=300)
+    return out
+
+
+@router.get("/me/bookmarks/practice")
+async def bookmarked_questions_for_practice(
+    language: str = Query(default="en", description="Session language: en, hi or mr"),
+    difficulty: Optional[DifficultyLevel] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(get_current_user),
+):
+    """The student's bookmarked questions (newest bookmark first) with solutions, for untimed practice.
+
+    Same item shape as GET /questions, so the practice screen can use them directly.
+    """
+    from app.core.languages import parse_language
+    from app.db.models.enums import QuestionStatus
+    from app.services.question_service import QuestionService
+
+    filters = [col(QuestionBookmark.user_id) == current_user.id, col(Question.status) == QuestionStatus.PUBLISHED]
+    if difficulty:
+        filters.append(col(Question.difficulty) == difficulty)
+    rows = (await session.exec(
+        select(Question)
+        .join(QuestionBookmark, col(QuestionBookmark.question_id) == col(Question.id))
+        .where(*filters)
+        .order_by(col(QuestionBookmark.created_at).desc())
+        .limit(limit)
+    )).all()
+    seen: set = set()
+    questions = [q for q in rows if not (q.id in seen or seen.add(q.id))]  # a question bookmarked twice appears once
+    items = await QuestionService(session)._build_batch_question_detail_responses(
+        questions, target_lang=parse_language(language), include_solutions=True
+    )
+    return JSONResponse(content=jsonable_encoder({"items": items, "total": len(items)}))
+
+
+@router.post("/me/bookmarks/{question_id}")
+async def add_bookmark(
+    question_id: int | str,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(get_current_user),
+):
+    user_id = current_user.id
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    # Check if question exists
+    q = await session.get(Question, qid_int)
+    if not q:
+        raise HTTPException(status_code=404, detail="Question not found")
+        
+    # Check if already bookmarked
+    stmt = select(QuestionBookmark).where(
+        col(QuestionBookmark.user_id) == user_id,
+        col(QuestionBookmark.question_id) == qid_int
+    )
+    result = await session.exec(stmt)
+    if result.first():
+        return {"message": "Already bookmarked"}
+        
+    bk = QuestionBookmark(
+        user_id=user_id,
+        question_id=qid_int
+    )
+    session.add(bk)
+    await session.commit()
+    await invalidate_user_cache(str(user_id))
+    return {"message": "Bookmark added", "bookmark_id": str(bk.id)}
+
+
+@router.delete("/me/bookmarks/{question_id}")
+async def remove_bookmark(
+    question_id: int | str,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(get_current_user),
+):
+    user_id = current_user.id
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        qid_int = int(question_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+
+    stmt = select(QuestionBookmark).where(
+        col(QuestionBookmark.user_id) == user_id,
+        col(QuestionBookmark.question_id) == qid_int
+    )
+    result = await session.exec(stmt)
+    bk = result.first()
+    if not bk:
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+        
+    await session.delete(bk)
+    await session.commit()
+    await invalidate_user_cache(str(user_id))
+    return {"message": "Bookmark removed"}
+
+
+@router.get("", response_model=List[UserRead])
+async def list_users(
+    skip: int = 0,
+    limit: int = 100,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_admin_section("admin.users")),
+):
+    cache = get_cache()
+    cache_key = build_cache_key(
+        "users:list",
+        role=str(current_user.role.value if hasattr(current_user.role, "value") else current_user.role) if current_user else "anon",
+        skip=skip,
+        limit=limit,
+    )
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return JSONResponse(content=cached_data)
+
+    from fastapi.encoders import jsonable_encoder
+    from app.services.user_service import get_profile_extras, PROFILE_EXTRA_FIELDS
+    user_service = UserService(session)
+    users = await user_service.list_users(current_user=current_user, skip=skip, limit=limit)
+    if users is not None:
+        serialized = jsonable_encoder(users)
+        # The raw user row has no tier or exam-preparation details; they live on the student profile.
+        extras = await get_profile_extras(session, [u["id"] for u in serialized if u.get("id") is not None])
+        for u in serialized:
+            e = extras.get(u.get("id"), {})
+            u["subscription_tier"] = e.get("subscription_tier", "FREE")
+            for f in PROFILE_EXTRA_FIELDS:
+                u[f] = e.get(f)
+        await cache.set(cache_key, serialized, ttl_seconds=600)
+        return JSONResponse(content=serialized)
+    return JSONResponse(content=[])
+
+
+@router.post(
+    "",
+    response_model=StaffCreateOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create an Admin/Teacher (or sub-admin); a temporary password is emailed",
+)
+async def create_staff_user(
+    payload: StaffCreate,
+    request: Request,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_roles([UserRole.SUPER_ADMIN])),
+):
+    user, email_sent = await UserService(session).create_staff_user(payload, created_by=current_user)
+    await invalidate_user_cache(str(user.id))
+    await audit_service.record_admin_action(
+        session,
+        audit_service.STAFF_CREATED,
+        actor=current_user,
+        target=user,
+        details={"role": user.role.value, "custom_role_id": payload.custom_role_id, "email_sent": email_sent},
+        request=request,
+    )
+    return StaffCreateOut(user=UserRead.model_validate(user), email_sent=email_sent)
+
+
+@router.post(
+    "/{user_id}/resend-credentials",
+    response_model=StaffCreateOut,
+    summary="Issue a new temporary password to an Admin/Teacher and email it",
+)
+async def resend_staff_credentials(
+    user_id: int | str,
+    request: Request,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_roles([UserRole.SUPER_ADMIN])),
+):
+    user, email_sent = await UserService(session).reset_staff_credentials(user_id)
+    await audit_service.record_admin_action(
+        session,
+        audit_service.STAFF_CREDENTIALS_RESENT,
+        actor=current_user,
+        target=user,
+        details={"email_sent": email_sent},
+        request=request,
+    )
+    return StaffCreateOut(user=UserRead.model_validate(user), email_sent=email_sent)
+
+
+@router.get("/lookup", response_model=Optional[UserRead], summary="Look Up a User by Exact Email (for inviting to a Challenge)")
+async def lookup_user_by_email(
+    email: str,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(get_current_user),
+):
+    res = await session.exec(select(User).where(func.lower(User.email) == email.strip().lower()))
+    user = res.first()
+    if not user or user.id == current_user.id:
+        return None
+    return user
+
+
+@router.get("/{user_id}", response_model=UserRead)
+async def get_user(
+    user_id: int | str,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(get_current_user),
+):
+    # A user may read their own record; anyone else needs Users access in the admin panel.
+    if str(current_user.id) != str(user_id):
+        from app.core.deps import admin_section_access
+        if not await admin_section_access(session, current_user, "admin.users"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to view this user.")
+
+    cache = get_cache()
+    cache_key = build_cache_key("users:detail", str(user_id))
+    # JSONResponse bypasses response_model, so secrets must be stripped by hand.
+    def _public(data: dict) -> dict:
+        return {k: v for k, v in data.items() if k != "password_hash"}
+
+    async def _with_subscription(data: dict) -> dict:
+        # Not cached: remaining days change daily.
+        from app.services.user_service import get_subscription_info
+        out = _public(data)
+        if data.get("id") is not None:
+            uid = int(data["id"])
+            out.update(await get_subscription_info(session, uid))
+            # Tier and exam-preparation details live on StudentProfile, not the raw user row.
+            from app.services.user_service import get_profile_extras, PROFILE_EXTRA_FIELDS
+            e = (await get_profile_extras(session, [uid])).get(uid, {})
+            out["subscription_tier"] = e.get("subscription_tier", "FREE")
+            for f in PROFILE_EXTRA_FIELDS:
+                out[f] = e.get(f)
+        return out
+
+    cached_data = await cache.get(cache_key)
+    if cached_data is not None:
+        return JSONResponse(content=await _with_subscription(cached_data))
+
+    from fastapi.encoders import jsonable_encoder
+    user_service = UserService(session)
+    user = await user_service.get_user_by_id(user_id)
+    if user is not None:
+        serialized = jsonable_encoder(user)
+        await cache.set(cache_key, serialized, ttl_seconds=1800)
+        return JSONResponse(content=await _with_subscription(serialized))
+    return user
+
+
+@router.put("/{user_id}", response_model=UserRead)
+async def update_user(
+    user_id: int | str,
+    user_in: UserUpdate,
+    request: Request,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_admin_section("admin.users")),
+):
+    user_service = UserService(session)
+    user = await user_service.update_user(user_id, user_in, current_user=current_user, request=request)
+    await invalidate_user_cache(str(user_id))
+    return user
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(
+    user_id: int | str,
+    request: Request,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_roles([UserRole.SUPER_ADMIN])),
+):
+    user_service = UserService(session)
+    await user_service.delete_user(user_id, actor=current_user, request=request)
+    await invalidate_user_cache(str(user_id))
+    return None

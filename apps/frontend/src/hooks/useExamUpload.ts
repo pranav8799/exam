@@ -1,0 +1,219 @@
+import { useState, useRef, useEffect } from 'react';
+import { PaperMode, StatusMessage } from '../types/exam';
+import { uploadExamPaper } from '../services/examService';
+import { ExamType } from '../types/examType';
+import { fetchActiveExamTypes } from '../services/examTypeService';
+import { clearExamIntegrityCache, invalidateExamReviewCache } from '../services/adminService';
+
+export interface ConflictModalState {
+  isOpen: boolean;
+  title: string;
+  message: string;
+  options: string[];
+  payload?: any;
+}
+
+export function useExamUpload() {
+  const [uploadMode, setUploadMode] = useState<'QUESTION_PAPER'>('QUESTION_PAPER');
+  const [paperMode, setPaperMode] = useState<PaperMode>('EXAM_WISE');
+  const [availableExamTypes, setAvailableExamTypes] = useState<ExamType[]>([]);
+  const [examName, setExamName] = useState('upsc');
+  const [selectedExamTypeId, setSelectedExamTypeId] = useState<number | undefined>(1);
+  const [year, setYear] = useState(String(new Date().getFullYear()));
+  const [setCode, setSetCode] = useState('SET_A');
+  const [paperType, setPaperType] = useState('previous_year_question');
+  // Marking scheme, prefilled from the exam type and editable for this paper
+  const [marksPerQuestion, setMarksPerQuestion] = useState('2');
+  const [negativeMarks, setNegativeMarks] = useState('0.67');
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
+  const [isUploading, setIsUploading] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<StatusMessage | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [conflictModal, setConflictModal] = useState<ConflictModalState | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Load available exam types from backend as the single source of truth
+  useEffect(() => {
+    fetchActiveExamTypes().then((types) => {
+      if (types && types.length > 0) {
+        setAvailableExamTypes(types);
+        const defaultType =
+          types.find((t) => t.type.toLowerCase() === 'upsc') ||
+          types.find((t) => t.type.toLowerCase() === 'upse') ||
+          types[0];
+        setExamName(defaultType.type);
+        setSelectedExamTypeId(defaultType.id);
+        setMarksPerQuestion(String(defaultType.positive_marks ?? 2));
+        setNegativeMarks(String(defaultType.negative_marks ?? 0.67));
+      }
+    }).catch((err) => {
+      console.warn('Failed to load active exam types:', err);
+    });
+  }, []);
+
+  const handleExamTypeChange = (typeCode: string) => {
+    setExamName(typeCode);
+    const matched = availableExamTypes.find((t) => t.type.toLowerCase() === typeCode.toLowerCase());
+    if (matched) {
+      setSelectedExamTypeId(matched.id);
+      setMarksPerQuestion(String(matched.positive_marks ?? 2));
+      setNegativeMarks(String(matched.negative_marks ?? 0.67));
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      setSelectedFile(e.target.files[0]);
+      setStatusMessage(null);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const file = e.dataTransfer.files[0];
+      if (file.type === 'application/pdf') {
+        setSelectedFile(file);
+        setStatusMessage(null);
+      } else {
+        setStatusMessage({ text: 'Please select a valid PDF file.', isError: true });
+      }
+    }
+  };
+
+  /** True when the paper was uploaded; false when it was refused or needs a conflict decision. */
+  const executeUpload = async (conflictResolution: string = 'CHECK'): Promise<boolean> => {
+    if (!selectedFile) {
+      setStatusMessage({ text: 'Please select a PDF file to upload.', isError: true });
+      return false;
+    }
+
+    if (paperMode === 'EXAM_WISE' && (!setCode || !setCode.trim())) {
+      setStatusMessage({ text: 'Target Paper Set Code (e.g. SET_A, SET_B, SET_C, SET_D) is required.', isError: true });
+      return false;
+    }
+
+    const marks = Number(marksPerQuestion);
+    const negative = Number(negativeMarks);
+    if (!marksPerQuestion.trim() || !(marks > 0)) {
+      setStatusMessage({ text: 'Enter the marks for a correct answer (more than 0).', isError: true });
+      return false;
+    }
+    if (!negativeMarks.trim() || !(negative >= 0) || negative > marks) {
+      setStatusMessage({ text: 'Enter the marks deducted for a wrong answer: 0 or more, and not more than the marks for a correct one.', isError: true });
+      return false;
+    }
+
+    setIsUploading(true);
+    setStatusMessage(null);
+
+    try {
+      await uploadExamPaper({
+        examName,
+        year,
+        paperType,
+        set_code: setCode,
+        exam_type: examName,
+        exam_type_id: selectedExamTypeId,
+        file: selectedFile,
+        conflict_resolution: conflictResolution,
+        paper_mode: paperMode,
+        marks_per_question: marks,
+        negative_marks_per_question: negative,
+      });
+      clearExamIntegrityCache();
+      invalidateExamReviewCache();
+      setStatusMessage({
+        text:
+          paperMode === 'MIXED'
+            ? 'Question bank uploaded. Each question keeps its own exam and year; AI tags the syllabus and difficulty in the background.'
+            : `Question paper uploaded successfully. AI extraction pipeline is now processing in the background.`,
+        isError: false,
+      });
+      setSelectedFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      return true;
+    } catch (err: any) {
+      if (err.status === 409 && err.payload && err.payload.requires_confirmation) {
+        setConflictModal({
+          isOpen: true,
+          title: err.payload.title || (err.payload.conflict_type === 'EXAM_EXISTS' ? 'Existing Exam Paper Detected' : 'Active Task Conflict Detected'),
+          message: err.payload.message || 'An exam paper with this canonical name already exists. Please select whether to overwrite it or skip:',
+          options: err.payload.options || ['OVERWRITE', 'SKIP'],
+        });
+      } else {
+        setStatusMessage({
+          text: err.message || 'Unable to connect to backend server.',
+          isError: true,
+        });
+      }
+    } finally {
+      setIsUploading(false);
+    }
+    return false;
+  };
+
+  const handleSubmit = async (e: React.FormEvent): Promise<boolean> => {
+    e.preventDefault();
+    return executeUpload('CHECK');
+  };
+
+  const handleConflictResolve = async (chosenOption: string) => {
+    setConflictModal(null);
+    if (chosenOption === 'CANCEL' || chosenOption === 'SKIP') {
+      setStatusMessage({ text: 'Upload operation skipped by user. Existing exam paper preserved.', isError: false });
+      return;
+    }
+    await executeUpload(chosenOption);
+  };
+
+  return {
+    uploadMode,
+    setUploadMode,
+    paperMode,
+    setPaperMode,
+    availableExamTypes,
+    examName,
+    setExamName: handleExamTypeChange,
+    selectedExamTypeId,
+    year,
+    setYear,
+    setCode,
+    setSetCode,
+    paperType,
+    setPaperType,
+    marksPerQuestion,
+    setMarksPerQuestion,
+    negativeMarks,
+    setNegativeMarks,
+    selectedFile,
+    setSelectedFile,
+    isUploading,
+    statusMessage,
+    isDragOver,
+    fileInputRef,
+    conflictModal,
+    setConflictModal,
+    handleFileChange,
+    handleDragOver,
+    handleDragLeave,
+    handleDrop,
+    handleSubmit,
+    handleConflictResolve,
+  };
+}
