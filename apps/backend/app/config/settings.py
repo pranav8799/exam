@@ -121,6 +121,42 @@ class Settings(BaseSettings):
     KNOWLEDGE_LLM_TIMEOUT_SECONDS: int = Field(default=90)
     KNOWLEDGE_LLM_MAX_RETRIES: int = Field(default=3)
     KNOWLEDGE_LLM_RATE_LIMIT_RPS: float = Field(default=1.0)
+    # ── 4-Channel Hybrid Similarity Search & Embeddings ──────────────────────
+    GEMINI_API_KEY: Optional[str] = Field(default=None)
+    GEMINI_EMBEDDING_MODEL: str = Field(default="models/gemini-embedding-001")
+    GEMINI_EMBEDDING_DIM: int = Field(default=3072)
+
+    JINA_API_KEY: Optional[str] = Field(default=None)
+    JINA_RERANKER_MODEL: str = Field(default="jina-reranker-v3.5")
+
+    # Hybrid similarity: weighted RRF over 5 retrieval channels (a weight of 0 turns a channel off)
+    SIMILARITY_WEIGHT_QUESTION_DENSE: float = Field(default=0.30)       # question vector  vs question vectors
+    SIMILARITY_WEIGHT_QUESTION_BM25: float = Field(default=0.25)        # question text    vs question texts
+    SIMILARITY_WEIGHT_EXPLANATION_DENSE: float = Field(default=0.25)    # solution vector  vs solution vectors
+    SIMILARITY_WEIGHT_ANSWER_BM25: float = Field(default=0.10)          # correct answer   vs correct answers
+    SIMILARITY_WEIGHT_ANSWER_IN_QUESTION_BM25: float = Field(default=0.10)  # correct answer vs question texts
+    SIMILARITY_BM25_K1: float = Field(default=1.2)
+    SIMILARITY_BM25_B: float = Field(default=0.75)
+    SIMILARITY_RRF_K: int = Field(default=60)
+    SIMILARITY_CHANNEL_LIMIT: int = Field(default=50)
+    SIMILARITY_RERANK_TOP_N: int = Field(default=200)
+    SIMILARITY_FINAL_LIMIT: int = Field(default=20)
+    # The Jina reranker is optional. Off: the order and the displayed score come straight from the fused
+    # ranking (weighted RRF). This setting covers live searches (questions without a stored list); a
+    # similar-lists run chooses for itself (Admin → Similar Questions, or `build_similar_lists --reranker`).
+    SIMILARITY_LIVE_USE_RERANKER: bool = Field(default=False)
+    # Precomputed similar questions (search-index run). Lists hold more than the admin count (max 20)
+    # so a student's session can be excluded at read time and enough remain.
+    SIMILARITY_STORED_LIST_SIZE: int = Field(default=50)
+    SIMILARITY_USE_PRECOMPUTED: bool = Field(default=True)  # False: always search live
+    # Pace of search-index runs against Jina. The current key allows 100k tokens/min in total; 80k leaves
+    # room for students' page views. Lowered automatically on HTTP 429 (see rate_limiter.py)
+    JINA_RERANK_TOKENS_PER_MINUTE: int = Field(default=80_000)
+    # Jina requests a run keeps in flight. The current key allows 2 concurrent requests in total;
+    # 1 leaves the other for students' live page views
+    JINA_RUN_MAX_CONCURRENT_REQUESTS: int = Field(default=1)
+    SEARCH_INDEX_STALE_RUN_MINUTES: int = Field(default=15)  # a "running" run without heartbeat for this long is treated as stopped
+
 
     # Async Database Configuration (Supports SQLite and PostgreSQL: postgresql+asyncpg://...)
     DATABASE_URL: str = Field(default="sqlite+aiosqlite:///exam_platform.db")

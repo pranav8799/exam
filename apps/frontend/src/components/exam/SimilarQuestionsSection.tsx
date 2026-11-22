@@ -8,7 +8,6 @@ import { RecommendedQuestionCard } from './RecommendedQuestionCard';
 interface SimilarQuestionsSectionProps {
   questionId: number | string | null | undefined;
   language?: string;
-  limit?: number;
 }
 
 /**
@@ -16,10 +15,10 @@ interface SimilarQuestionsSectionProps {
  * the student can attempt inline, with the solution revealed after answering.
  * Renders nothing when the question has no similar published questions.
  */
-export function SimilarQuestionsSection({ questionId, language = 'en', limit = 4 }: SimilarQuestionsSectionProps) {
+export function SimilarQuestionsSection({ questionId, language = 'en' }: SimilarQuestionsSectionProps) {
   const noExclusions = useMemo(() => new Set<string>(), []);
-  // Post-test review: the same theme as it appeared in other years' papers
-  const { similar, isLoading } = useSimilarQuestions(questionId, language, noExclusions, limit, true);
+  // Post-test review: the same theme as it appeared in other years' papers (how many: admin setting)
+  const { similar, isLoading } = useSimilarQuestions(questionId, language, noExclusions, true);
   const [expandedId, setExpandedId] = useState<number | string | null>(null);
   const [answers, setAnswers] = useState<Record<string | number, number | string>>({});
   const [solutions, setSolutions] = useState<Record<string | number, QuestionSolutionData>>({});

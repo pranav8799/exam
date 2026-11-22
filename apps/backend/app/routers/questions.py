@@ -28,7 +28,7 @@ router = APIRouter(prefix="/questions", tags=["Questions & Formatted Outputs"])
 @router.get("", response_model=QuestionPaginatedResponse, summary="Get Questions with Multi-Filtering & Pagination")
 async def list_questions(
     subject_id: Optional[int] = Query(default=None, description="Filter by Subject ID"),
-    subject_name: Optional[str] = Query(default=None, description="Filter by Subject Name (substring match)"),
+    subject_name: Optional[str] = Query(default=None, description="Filter by exact Subject Name (case, spacing and '&'/'and' ignored)"),
     subject_code: Optional[str] = Query(default=None, description="Filter by Subject Code"),
     topic_id: Optional[int] = Query(default=None, description="Filter by Topic ID"),
     topic_name: Optional[str] = Query(default=None, description="Filter by Topic Name (substring match)"),
@@ -270,7 +270,7 @@ async def create_question(
 
 @router.get("/recommended", summary="Lightweight Recommended Questions (no passages/metadata/hierarchy-detail/solutions)")
 async def list_recommended_questions(
-    subject_name: Optional[str] = Query(default=None, description="Filter by Subject Name (substring match)"),
+    subject_name: Optional[str] = Query(default=None, description="Filter by exact Subject Name (case, spacing and '&'/'and' ignored)"),
     topic_name: Optional[str] = Query(default=None, description="Filter by Topic Name (substring match)"),
     subtopic_name: Optional[str] = Query(default=None, description="Filter by Subtopic Name (substring match)"),
     exam_name: Optional[str] = Query(default=None, description="Filter by Exam Name e.g. upsc (substring match)"),
@@ -332,16 +332,7 @@ async def list_recommended_questions(
     return JSONResponse(content=res)
 
 
-CANONICAL_SUBJECT_MAP = {
-    "polity": ["polity", "indian polity", "indian polity and governance", "governance"],
-    "history": ["history", "modern history", "medieval history", "ancient history", "indian history", "indian history and culture"],
-    "art_culture": ["art and culture", "arts and culture", "indian culture"],
-    "geography": ["geography", "human and economic geography"],
-    "economy": ["economy", "economics", "indian economy"],
-    "environment": ["environment", "environment and ecology", "ecology and environment"],
-    "science": ["science and technology", "science and tech", "general science", "physics", "chemistry", "biology", "computer science"],
-    "social_security": ["social security in india", "insurance and social security principles", "labour laws and industrial relations"],
-}
+from app.core.subjects import same_subject  # noqa: E402
 
 
 def _norm_tax_str(s: Optional[str]) -> str:
@@ -353,15 +344,8 @@ def _norm_tax_str(s: Optional[str]) -> str:
 
 
 def _subject_matches(s1: Optional[str], s2: Optional[str]) -> bool:
-    n1, n2 = _norm_tax_str(s1), _norm_tax_str(s2)
-    if not n1 or not n2:
-        return False
-    if n1 == n2:
-        return True
-    for group in CANONICAL_SUBJECT_MAP.values():
-        if any(n1 == g or g in n1 for g in group) and any(n2 == g or g in n2 for g in group):
-            return True
-    return False
+    """Exactly the same subject name (ignoring case, spacing and "&" vs "and")."""
+    return same_subject(s1, s2)
 
 
 def _taxonomy_matches(t1: Optional[str], t2: Optional[str]) -> bool:
@@ -383,12 +367,20 @@ def _taxonomy_matches(t1: Optional[str], t2: Optional[str]) -> bool:
 )
 async def get_similar_questions(
     question_id: int | str,
-    limit: int = Query(default=5, ge=1, le=50),
+    limit: Optional[int] = Query(
+        default=None, ge=1, le=50,
+        description="Number of results. Omit to use the admin setting (Admin → Similar Questions).",
+    ),
     min_score: float = Query(default=0, ge=0),
     include_related: bool = Query(default=True, description="Also match through relationships (e.g. Suba -> Sarkar)"),
     include_question: bool = Query(default=False, description="Embed each result's question card (text + options)"),
     language: str = Query(default="en", description="Language of embedded question cards"),
     other_years_only: bool = Query(default=False, description="Only questions from other years (the same theme in other papers)"),
+    exclude_ids: Optional[str] = Query(
+        default=None,
+        description="Comma-separated question IDs never to return (e.g. the student's current session). "
+                    "Removed before ranking, so they do not use up the result slots.",
+    ),
     session: AsyncSession = Depends(get_async_session),
 ):
     """
@@ -409,8 +401,23 @@ async def get_similar_questions(
         
     service = QuestionService(session)
 
+    if limit is None:
+        # How many similar questions students see is an admin setting, not a frontend constant
+        from app.services.site_settings_service import SiteSettingsService
+        limit = await SiteSettingsService(session).get_similar_questions_limit()
+
+    excluded: set[int] = set()
+    for part in (exclude_ids or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            excluded.add(int(part))
+    excluded.discard(qid_int)
+
+    def _drop_excluded(results: list) -> list:
+        return [r for r in results if r.get("question_id") is None or int(r["question_id"]) not in excluded]
+
     # Fetch wider pool of candidates so taxonomy filtering has sufficient candidates
-    fetch_limit = max(50, limit * 5)
+    fetch_limit = max(50, (limit + len(excluded)) * 5)
 
     async def _from_other_years(results: list) -> list:
         if not other_years_only or not results:
@@ -462,7 +469,8 @@ async def get_similar_questions(
         t_st = t_st or target_q.subtopic_raw
 
         if not t_sub:
-            return candidates[:limit]
+            # Without a subject there is no way to keep suggestions inside it, so suggest nothing
+            return []
 
         # 1. Subject match is strictly required
         same_subj = []
@@ -495,10 +503,51 @@ async def get_similar_questions(
         # 4. Fallback to same subject
         return same_subj[:limit]
 
+    # ── 0. Precomputed list (search-index run), if still valid; else live search below ──
+    from app.config.settings import get_settings as _get_settings
+    if _get_settings().SIMILARITY_USE_PRECOMPUTED:
+        try:
+            from app.services.vector.stored_similarities import read_stored
+            from app.services.vector.similarity_retrieval_service import build_result_cards
+            stored = await read_stored(
+                session, qid_int, "other_years" if other_years_only else "default", limit, excluded,
+            )
+            if stored is not None:
+                if include_question and stored:
+                    stored = await build_result_cards(session, stored, parse_language(language))
+                else:
+                    for r in stored:
+                        r["tier"] = "exact" if r["similarity_score"] >= 85 else "related"
+                        r.pop("raw_score", None)
+                results = await _from_other_years(stored)
+                return JSONResponse(content={"question_id": qid_int, "source": "index",
+                                             "results": jsonable_encoder(results)})
+        except Exception as stored_err:
+            logger.warning(f"Stored similar list unusable for Q#{qid_int}: {stored_err}. Searching live.")
+            await session.rollback()
+
+    # ── 1. 4-Channel Hybrid Similarity (Dense + Lexical + Weighted RRF + Reranker) ──
+    try:
+        from app.services.vector.similarity_retrieval_service import HybridSimilarityService
+        lang_code = parse_language(language)
+        vec_service = HybridSimilarityService(session)
+        vec_results = await vec_service.find_similar_questions(
+            qid_int, limit=limit, include_question=include_question, target_lang=lang_code,
+            other_years_only=other_years_only, exclude_ids=excluded,
+        )
+        if vec_results:
+            # Already restricted to other years when asked; this only adds each result's source_year
+            results = await _from_other_years(vec_results)
+            return JSONResponse(content={"question_id": qid_int, "source": "live", "results": jsonable_encoder(results)})
+    except Exception as vec_err:
+        logger.warning(f"Hybrid similarity search failed for Q#{qid_int}: {vec_err}. Falling back...")
+        # A failed statement aborts the transaction; the fallbacks below need a usable session
+        await session.rollback()
+
     if target_q.knowledge_tags_ai:
         # Use AI Jaccard Similarity; if it finds nothing, fall through to the deterministic layer
         raw_ai = await service.get_similar_questions(qid_int, limit=fetch_limit)
-        results = await _filter_by_taxonomy(await _from_other_years(raw_ai))
+        results = await _filter_by_taxonomy(await _from_other_years(_drop_excluded(raw_ai)))
         if results:
             if include_question:
                 from sqlmodel import select, col
@@ -518,9 +567,12 @@ async def get_similar_questions(
     from app.cache import get_cache, build_cache_key
     cache = get_cache()
     lang_code = parse_language(language)
+    import hashlib
+    excluded_key = hashlib.sha1(",".join(map(str, sorted(excluded))).encode()).hexdigest()[:12] if excluded else None
     cache_key = build_cache_key(
         "questions:similar", str(qid_int), lim=limit, min=min_score, rel=include_related,
         q=include_question, l=lang_code.value if include_question else None, oy=other_years_only,
+        ex=excluded_key,
     )
     cached = await cache.get(cache_key)
     if cached is not None:
@@ -530,7 +582,7 @@ async def get_similar_questions(
     raw_det = await SimilarityService(session).find_similar(
         qid_int, limit=fetch_limit, min_score=min_score, include_related=include_related
     )
-    results = await _filter_by_taxonomy(await _from_other_years(raw_det))
+    results = await _filter_by_taxonomy(await _from_other_years(_drop_excluded(raw_det)))
     if include_question and results:
         from sqlmodel import select, col
         q_ids = [int(r["question_id"]) for r in results if r.get("question_id") is not None]

@@ -261,3 +261,12 @@ __all__.extend([
     "StudyPlanShare",
     "PlannerSettings",
 ])
+
+
+from app.db.models.question_embedding import QuestionEmbedding, Bm25TermStats, Bm25FieldStats
+
+__all__.extend(["QuestionEmbedding", "Bm25TermStats", "Bm25FieldStats"])
+
+from app.db.models.search_index import QuestionSimilarityList, SimilaritySubjectState, SearchIndexRun
+
+__all__.extend(["QuestionSimilarityList", "SimilaritySubjectState", "SearchIndexRun"])

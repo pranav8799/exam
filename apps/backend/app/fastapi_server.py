@@ -47,6 +47,7 @@ from app.routers.exam_types import router as exam_types_router
 from app.routers.admin_notifications import router as admin_notifications_router
 from app.routers.challenges import router as challenges_router
 from app.routers.site_settings import router as site_settings_router
+from app.routers.search_index import router as search_index_router
 from app.routers.admin_plans import router as admin_plans_router
 from app.routers.admin_discounts import admin_router as admin_discounts_router, public_router as discounts_public_router
 from app.routers.admin_grants import router as admin_grants_router
@@ -283,6 +284,7 @@ app.include_router(admin_notifications_router, prefix=settings.API_V1_STR)
 app.include_router(admin_planner_router, prefix=settings.API_V1_STR)
 app.include_router(challenges_router, prefix=settings.API_V1_STR)
 app.include_router(site_settings_router, prefix=settings.API_V1_STR)
+app.include_router(search_index_router, prefix=settings.API_V1_STR)
 # Premium plan, discounts & manual grants
 app.include_router(admin_plans_router, prefix=settings.API_V1_STR)
 app.include_router(admin_discounts_router, prefix=settings.API_V1_STR)

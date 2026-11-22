@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Search, Upload, Sliders, ClipboardCheck, BookOpen, Flag, Users, Award, Globe, Bell, MessageSquareQuote, MessageSquareWarning, BarChart2, Palette } from 'lucide-react';
+import { Search, Upload, Sliders, ClipboardCheck, BookOpen, Flag, Users, Award, Globe, Bell, MessageSquareQuote, MessageSquareWarning, BarChart2, Palette, Layers } from 'lucide-react';
 import { canAccessView } from '../../constants/adminAccess';
 
 interface Section {
@@ -23,6 +23,7 @@ const SECTIONS: Section[] = [
   { id: 'testimonials', label: 'Testimonial Approvals', keywords: 'testimonials stories approve reviews', icon: MessageSquareQuote },
   { id: 'analytics', label: 'Reports & Analytics', keywords: 'analytics reports statistics', icon: BarChart2 },
   { id: 'theme', label: 'Theme', keywords: 'theme colours colors appearance', icon: Palette },
+  { id: 'similar-questions', label: 'Similar Questions', keywords: 'similar questions suggestions recommendations count limit', icon: Layers },
 ];
 
 interface AdminQuickSearchProps {

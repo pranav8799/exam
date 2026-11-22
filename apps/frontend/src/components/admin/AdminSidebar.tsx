@@ -18,6 +18,7 @@ import {
   Medal,
   Languages,
   MessageSquareWarning,
+  Layers,
 } from 'lucide-react';
 import { useBreakpoint } from '../../hooks/useBreakpoint';
 import { canAccessView } from '../../constants/adminAccess';
@@ -95,6 +96,7 @@ export function AdminSidebar({
     { icon: MessageSquareQuote, label: 'Testimonial Approvals', id: 'testimonials' },
     { icon: BarChart2, label: 'Reports & Analytics', id: 'analytics' },
     { icon: Palette, label: 'Theme', id: 'theme' },
+    { icon: Layers, label: 'Similar Questions', id: 'similar-questions' },
   ];
 
 const prefetchedAdmin = new Set<string>();
@@ -150,6 +152,9 @@ function prefetchAdminView(viewId: string) {
       break;
     case 'theme':
       import('./views/ThemeSettingsView');
+      break;
+    case 'similar-questions':
+      import('./views/SimilarQuestionsSettingsView');
       break;
   }
 }

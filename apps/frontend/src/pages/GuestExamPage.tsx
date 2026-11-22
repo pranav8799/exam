@@ -34,12 +34,7 @@ import { formatEnum, extractCanonicalExamName, sortExamLabels, defaultExamLabel 
 import { fetchActiveExamTypes } from '../services/examTypeService';
 import { availableQuestionYears } from '../utils/examYears';
 import { guardedFetch } from '../utils/apiGuard';
-import {
-  mergeRecommendations,
-  recommendationCardToQuestion,
-  useSimilarQuestions,
-  isSameSubject,
-} from '../services/similarQuestionService';
+import { useSimilarQuestions } from '../services/similarQuestionService';
 import { parseTaxonomyParam, formatTaxonomyParam, parseYearParam } from '../utils/taxonomyParam';
 
 
@@ -697,8 +692,7 @@ export function GuestExamPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [language, activeQuestion?.question_id]);
 
-  // Dynamic Recommended Questions Pool
-  const [recommendedPool, setRecommendedPool] = useState<QuestionOut[]>([]);
+  // Similar-questions panel state (the cards come from useSimilarQuestions below)
   const [expandedRecId, setExpandedRecId] = useState<number | string | null>(null);
   const [recUserResponses, setRecUserResponses] = useState<Record<string, number | string>>({});
   const [recSolutions, setRecSolutions] = useState<Record<string | number, QuestionSolutionData>>(
@@ -710,20 +704,7 @@ export function GuestExamPage() {
   const [recSolutionLoading, setRecSolutionLoading] = useState<Record<string | number, boolean>>(
     {},
   );
-  const expandedRecIdRef = React.useRef<number | string | null>(null);
-  const recUserResponsesRef = React.useRef<Record<string, number | string>>({});
   const userToggledRecRef = React.useRef(false);
-
-  useEffect(() => {
-    expandedRecIdRef.current = expandedRecId;
-  }, [expandedRecId]);
-
-  useEffect(() => {
-    recUserResponsesRef.current = recUserResponses;
-  }, [recUserResponses]);
-
-  const [isPrefetchingRecs, setIsPrefetchingRecs] = useState(false);
-  const [isRecsExhausted, setIsRecsExhausted] = useState(false);
 
   const [recExamToggles, setRecExamToggles] = useState<ExamFilterToggles>({});
 
@@ -748,18 +729,9 @@ export function GuestExamPage() {
 
   const toggleRecExam = useCallback((examName: string) => {
     setRecExamToggles((prev) => {
-      const updated = { ...prev, [examName]: !prev[examName] };
-      setIsRecsExhausted(false);
-      setRecommendedPool([]);
-      return updated;
+      return { ...prev, [examName]: !prev[examName] };
     });
   }, []);
-
-  // Reset recommendations exhaustion when exam/subject/topic/subtopic/difficulty/recExamToggles/language change
-  useEffect(() => {
-    setIsRecsExhausted(false);
-    setRecommendedPool([]);
-  }, [gExam, gSubject, gTopic, gSubtopic, gDifficulty, recExamToggles, language]);
 
   // Mobile Responsiveness & Custom Dropdown Search State
   const { isTabletOrBelow } = useBreakpoint();
@@ -784,8 +756,8 @@ export function GuestExamPage() {
 
   const SESSION_KEY = `guest_exam_session_${selectedExamsList.length === 0 ? 'All Exams' : selectedExamsList.length === 1 ? shortenExamName(selectedExamsList[0]) : `${selectedExamsList.length} Exams`}_${gYear}_${gSubject}_${gTopic}_${gSubtopic}_${gCount}`;
 
-  // Knowledge Layer matches for the question on screen (shared Article / Act / concept first),
-  // shown ahead of the session-filter recommendations below
+  // Similar questions for the question on screen (same subject only; how many is an admin setting).
+  // The session's own questions are sent to the server so they never take up a slot.
   const sessionQuestionIds = useMemo(
     () => new Set(allQuestions.map((q) => String(q.question_id))),
     [allQuestions],
@@ -794,134 +766,6 @@ export function GuestExamPage() {
     activeQuestion?.question_id,
     language,
     sessionQuestionIds,
-  );
-
-  // Background prefetch function for dynamic recommended questions
-  const prefetchRecommendations = useCallback(
-    async (currentTestQuestions: QuestionOut[], currentPool: QuestionOut[]) => {
-      if (isPrefetchingRecs || isRecsExhausted) return;
-      setIsPrefetchingRecs(true);
-
-      try {
-        const existingIds = new Set<string | number>();
-        currentTestQuestions.forEach((q) => {
-          if (q.question_id) existingIds.add(q.question_id);
-        });
-        currentPool.forEach((q) => {
-          if (q.question_id) existingIds.add(q.question_id);
-        });
-        Object.keys(recUserResponsesRef.current || {}).forEach((qId) => existingIds.add(qId));
-
-        const excludeIdsParam = Array.from(existingIds).join(',');
-
-        const rawSubject = gSubject && !gSubject.startsWith('All Subjects') ? formatTaxonomyParam(selectedSubjectsList) : '';
-        const rawTopic = gTopic && !gTopic.startsWith('All Topics') ? formatTaxonomyParam(selectedTopicsList) : '';
-        const rawSubtopic = gSubtopic && !gSubtopic.startsWith('All Subtopics') ? formatTaxonomyParam(selectedSubtopicsList) : '';
-        const rawDiff = gDifficulty && !gDifficulty.startsWith('All') ? gDifficulty.trim() : '';
-        const targetExam = gExam
-          ? gExam.split(',')
-              .map((e) => {
-                const cleaned = e.trim().toLowerCase();
-                return cleaned.includes('upsc') ? 'upsc' : cleaned;
-              })
-              .filter(Boolean)
-              .join(',')
-          : '';
-
-        let newFetched: any[] = [];
-        const maxGuestRecs = Math.min(10, gCount);
-        const neededCount = Math.max(1, maxGuestRecs - currentPool.length);
-
-        if (neededCount <= 0 && currentPool.length >= maxGuestRecs) return;
-
-        const activeExams = Object.keys(recExamToggles).filter((e) => recExamToggles[e]);
-        if (activeExams.length === 0) {
-          setIsRecsExhausted(true);
-          return;
-        }
-
-        const subjParams = new URLSearchParams({ limit: String(neededCount) });
-        subjParams.append('exam_name', activeExams.map((e) => e.toLowerCase()).join(','));
-        if (rawSubject) subjParams.append('subject_name', rawSubject);
-        if (rawTopic) subjParams.append('topic_name', rawTopic);
-        if (rawSubtopic) subjParams.append('subtopic_name', rawSubtopic);
-        if (rawDiff) subjParams.append('difficulty', rawDiff);
-        if (excludeIdsParam) subjParams.append('exclude_ids', excludeIdsParam);
-        if (language) subjParams.append('language', language);
-
-        try {
-          const res = await guardedFetch(`/api/v1/questions/recommended?${subjParams.toString()}`);
-          if (res.ok) {
-            const data = await res.json();
-            newFetched = data.items || [];
-          }
-        } catch (err) {
-          console.warn('Subject recommendation fetch failed:', err);
-        }
-
-        // If no questions even of subject are found, mark exhausted and DO NOT call API in loop
-        if (newFetched.length === 0) {
-          setIsRecsExhausted(true);
-          return;
-        }
-
-        if (newFetched.length > 0) {
-          const formatted: QuestionOut[] = newFetched.map((item: any, idx: number) =>
-            recommendationCardToQuestion(item, idx, { subject: rawSubject, year: gYear, exam: gExam }),
-          );
-
-          setRecommendedPool((prev) => {
-            let newList = [...prev];
-            const existingIds = new Set(prev.map((q) => q.question_id));
-
-            for (let i = formatted.length - 1; i >= 0; i--) {
-              const q = formatted[i];
-              if (!existingIds.has(q.question_id)) {
-                newList.unshift(q);
-              }
-            }
-
-            while (newList.length > maxGuestRecs) {
-              let evictIdx = -1;
-              const currentExpanded = expandedRecIdRef.current;
-              const currentResponses = recUserResponsesRef.current;
-
-              // Prefer removing already-answered questions that are not expanded
-              for (let i = newList.length - 1; i >= 0; i--) {
-                const q = newList[i];
-                if (q.question_id !== currentExpanded && currentResponses[q.question_id]) {
-                  evictIdx = i;
-                  break;
-                }
-              }
-
-              // If none found, just find the oldest not expanded
-              if (evictIdx === -1) {
-                for (let i = newList.length - 1; i >= 0; i--) {
-                  if (newList[i].question_id !== currentExpanded) {
-                    evictIdx = i;
-                    break;
-                  }
-                }
-              }
-
-              if (evictIdx !== -1) {
-                newList.splice(evictIdx, 1);
-              } else {
-                break;
-              }
-            }
-            return newList;
-          });
-        }
-      } catch (err) {
-        console.warn('Background recommendation prefetch error:', err);
-        setIsRecsExhausted(true);
-      } finally {
-        setIsPrefetchingRecs(false);
-      }
-    },
-    [gSubject, gTopic, gSubtopic, gDifficulty, gExam, language, recExamToggles, isPrefetchingRecs, isRecsExhausted],
   );
 
   // Timer countdown
@@ -982,11 +826,8 @@ export function GuestExamPage() {
 
         const primaryH =
           (q.hierarchy || []).find((h: any) => h.is_primary) || (q.hierarchy || [])[0] || {};
-        const fallbackSubj =
-          gSubject && !gSubject.startsWith('All Subjects')
-            ? gSubject.split(',')[0].trim()
-            : 'General Studies';
-        const subjName = primaryH.subject_name || q.subject_name || fallbackSubj;
+        // A question without a subject keeps it blank: never borrow the session filter or a default name
+        const subjName = primaryH.subject_name || q.subject_name || '';
         const topName =
           primaryH.topic_name ||
           q.topic_name ||
@@ -1001,7 +842,7 @@ export function GuestExamPage() {
           options: optionsList,
           translations: q.translations || {},
           passage_translations: q.passage_translations || {},
-          section_code: subjName || 'General Studies',
+          section_code: subjName,
           subject_name: subjName,
           topic_name: topName,
           subtopic_name: subtopName,
@@ -1270,39 +1111,18 @@ export function GuestExamPage() {
     allQuestions,
   ]);
 
-  // Auto-prefetch background recommendations whenever pool has fewer than 5 items
-  useEffect(() => {
-    if (
-      allQuestions.length > 0 &&
-      recommendedPool.length < 5 &&
-      !isPrefetchingRecs &&
-      !isRecsExhausted
-    ) {
-      prefetchRecommendations(allQuestions, recommendedPool);
-    }
-  }, [
-    allQuestions,
-    recommendedPool.length,
-    isPrefetchingRecs,
-    isRecsExhausted,
-    prefetchRecommendations,
-  ]);
-
   // Handler to toggle recommended question accordion (NEVER touches the center card)
   const handleSelectRecommendation = (recQ: QuestionOut) => {
     userToggledRecRef.current = true;
     setExpandedRecId((prev) => (prev === recQ.question_id ? null : recQ.question_id));
   };
 
-  // Keep the first recommended question expanded until the user manually
-  // expands/collapses a card themselves — recommendedPool can reorder or evict
-  // items as it prefetches, so a one-shot "expand index 0 once" can end up
-  // pointing at a question_id that's no longer in the list.
+  // Keep the first similar question expanded until the user expands/collapses a card themselves
   useEffect(() => {
     if (!userToggledRecRef.current) {
-      setExpandedRecId(similarRecs[0]?.question_id ?? recommendedPool[0]?.question_id ?? null);
+      setExpandedRecId(similarRecs[0]?.question_id ?? null);
     }
-  }, [recommendedPool, similarRecs]);
+  }, [similarRecs]);
 
   // Fetches the full comprehensive solution for a recommended question (once per question)
   const fetchRecommendationSolution = async (qId: number | string) => {
@@ -1375,21 +1195,15 @@ export function GuestExamPage() {
     fetchRecommendationSolution(rec.question_id);
   };
 
-  // All up to 10 recommended items to display for Guest mode
+  // Only similar questions (same subject; how many is decided by the server); exam toggles narrow them by exam
   const activeRecExams = Object.keys(recExamToggles).filter((e) => recExamToggles[e]).map((e) => e.toLowerCase());
-  const activeSubject = activeQuestion?.subject || activeQuestion?.section_code;
-  const displayRecs = activeRecExams.length > 0 
-    ? mergeRecommendations(similarRecs, recommendedPool).filter((q) => {
+  const displayRecs = activeRecExams.length > 0
+    ? similarRecs.filter((q) => {
+        if (sessionQuestionIds.has(String(q.question_id))) return false;
         if (!q.exam_name) return true;
         const canonical = extractCanonicalExamName(q.exam_name).toLowerCase();
-        const matchesExam = activeRecExams.includes(canonical) || activeRecExams.includes(q.exam_name.toLowerCase());
-        if (!matchesExam) return false;
-        if (activeSubject && !activeSubject.toLowerCase().startsWith('all') && activeSubject !== 'General Studies') {
-          const qSubj = q.subject || q.section_code;
-          return isSameSubject(qSubj, activeSubject);
-        }
-        return true;
-      }).slice(0, 10)
+        return activeRecExams.includes(canonical) || activeRecExams.includes(q.exam_name.toLowerCase());
+      })
     : [];
 
   // Switch Question
@@ -1476,7 +1290,12 @@ export function GuestExamPage() {
     const expContent =
       (targetQuestion as any).explanation?.detailed_solution ||
       (targetQuestion as any).explanation ||
-      `Option (${correctLabel}) is correct for this question on ${targetQuestion.topic_name || targetQuestion.subject || gSubject || 'General Studies'}.`;
+      (() => {
+        const area = targetQuestion.topic_name || targetQuestion.subject;
+        return area
+          ? `Option (${correctLabel}) is correct for this question on ${area}.`
+          : `Option (${correctLabel}) is correct for this question.`;
+      })();
 
     const distractorScores: Record<string, any> = {};
     if (Array.isArray(targetQuestion.options)) {
@@ -4184,7 +4003,7 @@ export function GuestExamPage() {
             <RecommendedQuestionsPanel
               title={null}
               questions={displayRecs}
-              isLoading={isPrefetchingRecs || isLoadingSimilar}
+              isLoading={isLoadingSimilar}
               expandedId={expandedRecId}
               selectedOptions={recUserResponses}
               solutions={recSolutions}
@@ -4275,13 +4094,9 @@ export function GuestExamPage() {
             }}
           >
             <RecommendedQuestionsPanel
-              subtitle={
-                similarRecs.length > 0
-                  ? `Linked to this question first, then more from ${gSubject || 'your focus area'}.`
-                  : `Matched questions for ${gSubject || 'your focus area'}.`
-              }
+              subtitle="Questions from the same subject that test similar ideas."
               questions={displayRecs}
-              isLoading={isPrefetchingRecs || isLoadingSimilar}
+              isLoading={isLoadingSimilar}
               expandedId={expandedRecId}
               selectedOptions={recUserResponses}
               solutions={recSolutions}

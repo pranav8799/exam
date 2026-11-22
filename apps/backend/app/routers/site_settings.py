@@ -4,7 +4,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_async_session
 from app.db.models.user import User, UserRole
 from app.core.deps import require_roles, require_admin_section
-from app.schemas.site_settings import ThemeOut, ThemeUpdatePayload
+from app.schemas.site_settings import (
+    SimilarQuestionsSettingsOut,
+    SimilarQuestionsSettingsUpdate,
+    ThemeOut,
+    ThemeUpdatePayload,
+)
 from app.services.site_settings_service import SiteSettingsService
 
 router = APIRouter(prefix="/site-settings", tags=["Site Settings"])
@@ -23,5 +28,28 @@ async def update_active_theme(
 ):
     try:
         return await SiteSettingsService(session).set_theme(payload.theme_name, current_user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+
+
+@router.get("/similar-questions", response_model=SimilarQuestionsSettingsOut)
+async def get_similar_questions_settings(
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_admin_section("admin.similar_questions")),
+):
+    """How many similar questions students see per question."""
+    return await SiteSettingsService(session).get_similar_questions_settings()
+
+
+@router.put("/similar-questions", response_model=SimilarQuestionsSettingsOut)
+async def update_similar_questions_settings(
+    payload: SimilarQuestionsSettingsUpdate,
+    session: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(require_admin_section("admin.similar_questions")),
+):
+    try:
+        return await SiteSettingsService(session).set_similar_questions_limit(
+            payload.similar_questions_limit, current_user.id
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))

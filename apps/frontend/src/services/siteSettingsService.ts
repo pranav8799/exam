@@ -69,3 +69,34 @@ export async function updateActiveTheme(themeName: string): Promise<ThemeSetting
   invalidateActiveThemeCache();
   return data;
 }
+
+export interface SimilarQuestionsSettings {
+  /** How many similar questions students see per question */
+  similar_questions_limit: number;
+  min_limit: number;
+  max_limit: number;
+  updated_at: string | null;
+}
+
+export async function fetchSimilarQuestionsSettings(): Promise<SimilarQuestionsSettings> {
+  const res = await guardedFetch(`${API_BASE_URL}/similar-questions`, { headers: getAuthHeader() });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ detail: 'Failed to load the setting' }));
+    throw new Error(errorData.detail || 'Could not load the similar questions setting.');
+  }
+  return res.json();
+}
+
+export async function updateSimilarQuestionsSettings(limit: number): Promise<SimilarQuestionsSettings> {
+  const res = await guardedFetch(`${API_BASE_URL}/similar-questions`, {
+    method: 'PUT',
+    headers: getAuthHeader(),
+    body: JSON.stringify({ similar_questions_limit: limit }),
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ detail: 'Failed to save the setting' }));
+    const detail = Array.isArray(errorData.detail) ? errorData.detail[0]?.msg : errorData.detail;
+    throw new Error(detail || 'Could not save the similar questions setting.');
+  }
+  return res.json();
+}

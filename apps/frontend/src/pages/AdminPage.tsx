@@ -27,6 +27,7 @@ const ReportedQuestionsView = lazy(() => import('../components/admin/views/Repor
 const TestimonialsView = lazy(() => import('../components/admin/views/TestimonialsView').then(m => ({ default: m.TestimonialsView })));
 const ExamSyllabusPanel = lazy(() => import('../components/admin/syllabus/ExamSyllabusPanel').then(m => ({ default: m.ExamSyllabusPanel })));
 const ThemeSettingsView = lazy(() => import('../components/admin/views/ThemeSettingsView').then(m => ({ default: m.ThemeSettingsView })));
+const SimilarQuestionsSettingsView = lazy(() => import('../components/admin/views/SimilarQuestionsSettingsView').then(m => ({ default: m.SimilarQuestionsSettingsView })));
 
 function NoAccessView({ onHome }: { onHome: () => void }) {
   return (
@@ -188,6 +189,8 @@ export function AdminPage() {
         return <FeedbackView onChanged={refreshFeedbackCount} />;
       case 'theme':
         return <ThemeSettingsView />;
+      case 'similar-questions':
+        return <SimilarQuestionsSettingsView />;
       default:
         return <AdminOverviewView onNavigate={handleNavigate} permissions={permissions} />;
     }
