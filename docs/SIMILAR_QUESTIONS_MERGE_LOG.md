@@ -207,6 +207,8 @@ the searches that found it and "RRF ranked" / "Jina reranked"), or call
 | 2026-11-22 | All of the above committed in one commit on branch `feature/similar-questions`. |
 | 2026-11-22 | `feature/similar-questions` merged into `main` locally as a fast-forward (`main` had no other commits since `55f0280 first commit`). |
 | 2026-11-22 | **Push to GitHub (`origin`, `pranav8799/exam`) refused with HTTP 403**: Git on this machine (Windows Git Credential Manager) is signed in as a different GitHub account that has no write access to the repository. Both branches are to be pushed once the right account is signed in or given access. |
+| 2026-11-24 | Fixed by naming the account in this project's remote: `origin` = `https://pranav8799@github.com/pranav8799/exam.git`. Git Credential Manager then asked once for a `pranav8799` sign-in (done in the browser by the owner) and keeps it next to the other account's login, which other projects still use. |
+| 2026-11-24 | `feature/similar-questions` and `main` pushed to GitHub (`pranav8799/exam`), together with this log update. |
 
 **Included besides the feature files:** `.gitnexusignore` (keeps the branch copy and `.db_backups/` out of the GitNexus
 index), `CLAUDE.md` (GitNexus refreshed its index counts), `uv.lock` (adds `pgvector`), this log and
