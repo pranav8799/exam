@@ -186,6 +186,51 @@ class TestDeterministicPipeline(unittest.IsolatedAsyncioTestCase):
             assert opt_a_reasoning.why_tempting == "Jainism is prominent"
             assert opt_a_reasoning.whats_actually_true == "Hastimalla was a poet, not a monk"
 
+    async def test_core_concept_nature_and_approach_are_stored(self):
+        """New header tags are stored on the question, and Core Concept becomes the explanation's core concept."""
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def get_test_session():
+            async with self.session_factory() as s:
+                yield s
+
+        async with self.session_factory() as session:
+            exam = Exam(code="UPSC_1979_TAGS", name="UPSC Prelims 1979", status=ExamStatus.PENDING_HUMAN_REVIEW, total_questions=2)
+            session.add(exam)
+            await session.commit()
+            await session.refresh(exam)
+            exam_id = exam.id
+
+        base = dict(
+            subject_raw="Art & Culture", topic_raw="Architecture", subtopic_raw="Cave Temples (Ajanta, Ellora)",
+            difficulty_raw="Moderate", stem="Ajanta Caves are located in the State of",
+            options={"A": "Maharashtra", "B": "Gujarat", "C": "Tamil Nadu", "D": "West Bengal"},
+            answer_label="A", solution_text="They are in Maharashtra.", page_numbers=[1],
+        )
+        tagged = QuestionRecord(question_number=1, core_concept_raw="Ajanta Caves", nature_raw="Static – Basic", approach_raw="Factual", **base)
+        untagged = QuestionRecord(question_number=2, **base)
+
+        registrar = BatchQuestionRegistrar(session_factory=get_test_session)
+        summary = await registrar.commit_question_records_in_batches(exam_id=exam_id, records=[tagged, untagged], storage=MagicMock())
+        assert summary.failed_batches == 0
+
+        async with self.session_factory() as session:
+            qs = {q.question_number_in_paper: q for q in (await session.exec(select(Question).where(Question.exam_id == exam_id))).all()}
+            assert (qs[1].core_concept_raw, qs[1].nature_raw, qs[1].approach_raw) == ("Ajanta Caves", "Static – Basic", "Factual")
+            assert (qs[2].core_concept_raw, qs[2].nature_raw, qs[2].approach_raw) == (None, None, None)
+            expl = {e.question_id: e for e in (await session.exec(select(QuestionExplanation))).all()}
+            assert expl[qs[1].id].core_concept == "Ajanta Caves"
+            # Older papers keep the previous fallback: the Nano Theme
+            assert expl[qs[2].id].core_concept == "Cave Temples (Ajanta, Ellora)"
+
+        # Re-extraction updates the tags in place
+        retagged = QuestionRecord(question_number=1, core_concept_raw="Ajanta Caves", nature_raw="Static – Advanced", approach_raw="Conceptual", **base)
+        await registrar.commit_question_records_in_batches(exam_id=exam_id, records=[retagged], storage=MagicMock())
+        async with self.session_factory() as session:
+            q1 = (await session.exec(select(Question).where(Question.exam_id == exam_id, Question.question_number_in_paper == 1))).first()
+            assert (q1.nature_raw, q1.approach_raw) == ("Static – Advanced", "Conceptual")
+
     async def test_confidence_flag_and_hitl_task_creation(self):
         """Verify that corrupted questions drop confidence and generate HumanReviewTask."""
         async with self.session_factory() as session:

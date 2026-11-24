@@ -300,6 +300,9 @@ class HumanReviewService:
             "section_code": question.section_code,
             "question_number": question.question_number_in_paper,
             "question_type_tag": raw_type_tag,
+            "core_concept_raw": question.core_concept_raw,
+            "nature_raw": question.nature_raw,
+            "approach_raw": question.approach_raw,
             "status": question.status.value,
             "difficulty": question.difficulty.value if hasattr(question.difficulty, "value") else str(question.difficulty),
             "marks": question.marks,
@@ -518,6 +521,12 @@ class HumanReviewService:
                 question.topic_raw = target_rec.topic_raw
             if target_rec.subtopic_raw:
                 question.subtopic_raw = target_rec.subtopic_raw
+            if target_rec.core_concept_raw:
+                question.core_concept_raw = target_rec.core_concept_raw
+            if target_rec.nature_raw:
+                question.nature_raw = target_rec.nature_raw
+            if target_rec.approach_raw:
+                question.approach_raw = target_rec.approach_raw
             self.session.add(question)
 
             # Update English translation

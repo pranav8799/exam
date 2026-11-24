@@ -4,7 +4,8 @@ Two layouts are supported:
 - Tagged papers: "Q1. [Subject: ...] [Microtheme: ...]" headers, "(A)" options, "Answer: (B)".
 - Question banks: "1. <stem> [MPSC Mains 2017]", "A." options, "Answer B", "Solution.", arrow
   statement lines ("➤ (a) ..."), and chapter headings ("— Economic Planning —") between questions.
-  They carry no syllabus tags; the Knowledge Layer AI fills those in after upload.
+  They carry no syllabus tags; nothing fills those in automatically (the Knowledge Layer AI can be run
+  by hand with `python -m app.scripts.backfill_knowledge_layer`).
 
 Parses OCR-generated full markdown into structured QuestionRecord objects:
 - Q_HEADER: [Subject: ...] [Topic: ...] [Sub-topic: ...] [Difficulty: ...]
@@ -47,10 +48,7 @@ from app.pipeline.patterns import (
     TABLE_ROW_PATTERN,
     VISUAL_REFERENCE_PATTERN,
     STATEMENT_LINE_PATTERN,
-    SUBJECT_TAG_PATTERN,
-    TOPIC_TAG_PATTERN,
-    SUBTOPIC_TAG_PATTERN,
-    DIFFICULTY_TAG_PATTERN,
+    HEADER_TAG_PATTERNS,
     TYPE_TAG_PATTERN,
     RELATED_REFS_HEADER_PATTERN,
     extract_header_tags,
@@ -68,6 +66,10 @@ class QuestionRecord(BaseModel):
     subtopic_raw: Optional[str] = None
     difficulty_raw: Optional[str] = None
     type_raw: Optional[str] = None
+    # Header tags added to papers in Nov 2026; absent (None) in older papers
+    core_concept_raw: Optional[str] = None
+    nature_raw: Optional[str] = None
+    approach_raw: Optional[str] = None
     difficulty: DifficultyLevel = Field(default=DifficultyLevel.MEDIUM)
 
     stem: str
@@ -381,10 +383,7 @@ def parse_question_block(
                 continue
             arrow_line_idx.add(len(clean_stem_lines))
         # Check if line contains metadata tags (a table cell is always stem content)
-        has_tag = not TABLE_ROW_PATTERN.match(l_str) and any(
-            p.search(l_str)
-            for p in (SUBJECT_TAG_PATTERN, TOPIC_TAG_PATTERN, SUBTOPIC_TAG_PATTERN, DIFFICULTY_TAG_PATTERN, TYPE_TAG_PATTERN)
-        )
+        has_tag = not TABLE_ROW_PATTERN.match(l_str) and any(p.search(l_str) for p in HEADER_TAG_PATTERNS)
         # A header wrapped inside a tag ("[Difficulty:" / "Moderate]") continues on this line
         header_so_far = " ".join(header_block)
         continues_open_tag = not clean_stem_lines and header_so_far.count("[") > header_so_far.count("]")
@@ -636,6 +635,9 @@ def parse_question_block(
         subtopic_raw=subtopic_raw,
         difficulty_raw=difficulty_raw,
         type_raw=type_raw,
+        core_concept_raw=tags.get("core_concept_raw"),
+        nature_raw=tags.get("nature_raw"),
+        approach_raw=tags.get("approach_raw"),
         difficulty=difficulty,
         stem=stem,
         statement_lines=statement_lines,

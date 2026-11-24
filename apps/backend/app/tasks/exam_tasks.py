@@ -219,13 +219,10 @@ async def async_process_exam_pdf(
             except Exception as trans_err:
                 log.warning(f"Could not auto-trigger post-extraction translation for Exam #{exam_id}: {trans_err}")
 
-        # Knowledge Layer enrichment (concepts / entities / relationships) for similar-question retrieval
-        from app.tasks.enrichment_tasks import dispatch_exam_enrichment
-        dispatch_exam_enrichment(exam_id, log)
-
-        # 4-Channel Hybrid Vectorization (Question dense/lexical + Answer dense/lexical)
-        from app.tasks.vector_tasks import dispatch_exam_vectorization
-        dispatch_exam_vectorization(exam_id, log)
+        # Extraction ends here: no LLM tagging and no embeddings are started from an upload. Embeddings
+        # and similar-question lists are built by the search-index runs an admin starts (Admin → Similar
+        # Questions, or the backfill_question_embeddings / build_similar_lists scripts), which pick up
+        # every new, changed or newly published question from the database state.
 
         log.info("=" * 70)
         log.info(

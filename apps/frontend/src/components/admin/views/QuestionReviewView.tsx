@@ -98,6 +98,9 @@ interface QuestionDetailItem {
   question_type: string;
   question_type_tag?: string | null;
   cognitive_skill?: string | null;
+  core_concept_raw?: string | null;
+  nature_raw?: string | null;
+  approach_raw?: string | null;
   difficulty: string;
   marks: number;
   negative_marks?: number;
@@ -423,6 +426,9 @@ export function QuestionReviewView({ initialExam, onNavigate }: QuestionReviewVi
           question_type: q.question_type || 'SINGLE_CHOICE',
           question_type_tag: q.question_type_tag || q.metadata?.cognitive_skill || null,
           cognitive_skill: q.metadata?.cognitive_skill || q.question_type_tag || null,
+          core_concept_raw: q.core_concept_raw || null,
+          nature_raw: q.nature_raw || null,
+          approach_raw: q.approach_raw || null,
           difficulty: q.difficulty || 'MEDIUM',
           marks: q.marks !== undefined ? q.marks : 2.0,
           negative_marks: q.negative_marks !== undefined ? q.negative_marks : 0.66,

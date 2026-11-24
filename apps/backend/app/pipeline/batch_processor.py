@@ -782,6 +782,9 @@ class BatchQuestionRegistrar:
                                     topic_raw=rec.topic_raw,
                                     subtopic_raw=rec.subtopic_raw,
                                     difficulty_raw=rec.difficulty_raw,
+                                    core_concept_raw=rec.core_concept_raw,
+                                    nature_raw=rec.nature_raw,
+                                    approach_raw=rec.approach_raw,
                                     extraction_confidence=rec.extraction_confidence,
                                     extraction_issues_json=rec.extraction_issues,
                                     knowledge_tags_raw=knowledge_tags_from_record(rec),
@@ -803,6 +806,9 @@ class BatchQuestionRegistrar:
                                 q_obj.topic_raw = rec.topic_raw
                                 q_obj.subtopic_raw = rec.subtopic_raw
                                 q_obj.difficulty_raw = rec.difficulty_raw
+                                q_obj.core_concept_raw = rec.core_concept_raw
+                                q_obj.nature_raw = rec.nature_raw
+                                q_obj.approach_raw = rec.approach_raw
                                 q_obj.extraction_confidence = rec.extraction_confidence
                                 q_obj.extraction_issues_json = rec.extraction_issues
                                 q_obj.knowledge_tags_raw = knowledge_tags_from_record(rec)
@@ -938,7 +944,9 @@ class BatchQuestionRegistrar:
 
                             # Question Explanation
                             q_expl = expl_by_qid.get(question_id)
-                            core_concept_val = rec.subtopic_raw or rec.topic_raw or None
+                            # The paper's own [Core Concept: ...] tag when it has one; older papers fall
+                            # back to the Nano Theme / Microtheme as before
+                            core_concept_val = rec.core_concept_raw or rec.subtopic_raw or rec.topic_raw or None
                             traps_list = [rec.common_mistake] if rec.common_mistake else []
                             if not q_expl:
                                 q_expl = QuestionExplanation(

@@ -1,11 +1,12 @@
 """Search index: embeddings → BM25 statistics → precomputed similar questions, as tracked runs.
 
 A run is started from the CLI (`backfill_question_embeddings` for vectors, `build_similar_lists` for
-lists), the admin dashboard (Admin → Similar Questions) or after a PDF upload. Each run is a row in
-`search_index_runs` with its phase, progress, estimate, summary and, if it stopped, a plain reason.
+lists) or the admin dashboard (Admin → Similar Questions); a PDF upload no longer starts one (since
+2026-11-24; older runs may still show trigger "upload"). Each run is a row in `search_index_runs` with
+its phase, progress, estimate, summary and, if it stopped, a plain reason.
 
 Run kinds (`options["kind"]`)
-  "vectors"        phases 1–2: embeddings (Gemini) and BM25 statistics. Started after a PDF upload.
+  "vectors"        phases 1–2: embeddings (Gemini) and BM25 statistics.
   "similar_lists"  phases 2–3: BM25 statistics (no API cost) and similar lists. `options["use_reranker"]`
                    chooses the ranking: False = fused ranking (RRF) only, True = Jina reranker.
   "full"           all three phases (the original behaviour; `skip_similar` / `skip_embeddings` still work).

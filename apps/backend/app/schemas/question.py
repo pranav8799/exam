@@ -193,6 +193,10 @@ class QuestionDetailResponse(BaseModel):
     question_number_in_paper: int
     question_type: str = "SINGLE_CHOICE"
     question_type_tag: Optional[str] = None
+    # Header tags from the paper ([Core Concept] [Nature] [Approach]); None for older papers
+    core_concept_raw: Optional[str] = None
+    nature_raw: Optional[str] = None
+    approach_raw: Optional[str] = None
     difficulty: str = "MEDIUM"
     marks: float = 2.0
     negative_marks: float = 0.66

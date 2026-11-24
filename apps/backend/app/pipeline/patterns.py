@@ -46,26 +46,73 @@ ANSWER_OPTIONS_LABEL_PATTERN = re.compile(r"(?i)^\s*answer\s+options?\s*:?\s*$")
 # Header Tag Extractors (tolerant of [, (, {, <, missing brackets, line breaks, extra spaces)
 # Example: [Subject: History & Culture] [Topic: Ancient Indian Literature] [Sub-topic: Sanskrit Dramatists] [Difficulty: Tough] [Type: Chronology]
 # Also supports: [Microtheme: ...] as Topic, [Nano Theme: ...] as Subtopic, [Question Type: ...] as Type
-SUBJECT_TAG_PATTERN = re.compile(
-    r"(?i)[\[\(\{<]?\s*Subject\s*:\s*([^\]\)\}>\n\r]+?)(?=[\]\)\}>]|\s*(?:Topic|Micro[-\s]?theme|Sub[-\s]?topic|Nano[-\s]?theme|Difficulty|Question\s*Type|Question\s*Nature|Type)\s*:|$)",
-    re.UNICODE,
+# Papers from Nov 2026 also carry [Core Concept: ...] [Nature: Static – Basic] [Approach: Factual]
+# ("Nature" alone is its own tag; "Question Nature" stays an alias of Type, as before).
+#
+# Key names of every header tag; an unbracketed tag value stops where the next key starts
+_SUBJECT_KEY = r"Subject"
+_TOPIC_KEY = r"(?:Topic|Micro[-\s]?theme)"
+_SUBTOPIC_KEY = r"(?:Sub[-\s]?topic|Nano[-\s]?theme)"
+_DIFFICULTY_KEY = r"Difficulty"
+_TYPE_KEY = r"(?:Question\s*Type|Question\s*Nature|Type)"
+_CORE_CONCEPT_KEY = r"Core[-\s]?Concept"
+_NATURE_KEY = r"(?<!Question )(?<!Question)\bNature"
+_APPROACH_KEY = r"Approach"
+_ALL_KEYS = (_SUBJECT_KEY, _TOPIC_KEY, _SUBTOPIC_KEY, _DIFFICULTY_KEY, _TYPE_KEY, _CORE_CONCEPT_KEY, _NATURE_KEY, _APPROACH_KEY)
+
+
+def _tag_pattern(key: str) -> re.Pattern:
+    others = "|".join(k for k in _ALL_KEYS if k != key)
+    return re.compile(
+        rf"(?i)[\[\(\{{<]?\s*{key}\s*:\s*([^\]\)\}}>\n\r]+?)(?=[\]\)\}}>]|\s*(?:{others})\s*:|$)",
+        re.UNICODE,
+    )
+
+
+SUBJECT_TAG_PATTERN = _tag_pattern(_SUBJECT_KEY)
+TOPIC_TAG_PATTERN = _tag_pattern(_TOPIC_KEY)
+SUBTOPIC_TAG_PATTERN = _tag_pattern(_SUBTOPIC_KEY)
+DIFFICULTY_TAG_PATTERN = _tag_pattern(_DIFFICULTY_KEY)
+TYPE_TAG_PATTERN = _tag_pattern(_TYPE_KEY)
+CORE_CONCEPT_TAG_PATTERN = _tag_pattern(_CORE_CONCEPT_KEY)
+NATURE_TAG_PATTERN = _tag_pattern(_NATURE_KEY)
+APPROACH_TAG_PATTERN = _tag_pattern(_APPROACH_KEY)
+
+# Every header tag pattern: a stem line matching any of them belongs to the header
+HEADER_TAG_PATTERNS = (
+    SUBJECT_TAG_PATTERN, TOPIC_TAG_PATTERN, SUBTOPIC_TAG_PATTERN, DIFFICULTY_TAG_PATTERN,
+    TYPE_TAG_PATTERN, CORE_CONCEPT_TAG_PATTERN, NATURE_TAG_PATTERN, APPROACH_TAG_PATTERN,
 )
-TOPIC_TAG_PATTERN = re.compile(
-    r"(?i)[\[\(\{<]?\s*(?:Topic|Micro[-\s]?theme)\s*:\s*([^\]\)\}>\n\r]+?)(?=[\]\)\}>]|\s*(?:Sub[-\s]?topic|Nano[-\s]?theme|Difficulty|Subject|Question\s*Type|Question\s*Nature|Type)\s*:|$)",
-    re.UNICODE,
-)
-SUBTOPIC_TAG_PATTERN = re.compile(
-    r"(?i)[\[\(\{<]?\s*(?:Sub[-\s]?topic|Nano[-\s]?theme)\s*:\s*([^\]\)\}>\n\r]+?)(?=[\]\)\}>]|\s*(?:Difficulty|Subject|Topic|Micro[-\s]?theme|Question\s*Type|Question\s*Nature|Type)\s*:|$)",
-    re.UNICODE,
-)
-DIFFICULTY_TAG_PATTERN = re.compile(
-    r"(?i)[\[\(\{<]?\s*Difficulty\s*:\s*([^\]\)\}>\n\r]+?)(?=[\]\)\}>]|\s*(?:Subject|Topic|Micro[-\s]?theme|Sub[-\s]?topic|Nano[-\s]?theme|Question\s*Type|Question\s*Nature|Type)\s*:|$)",
-    re.UNICODE,
-)
-TYPE_TAG_PATTERN = re.compile(
-    r"(?i)[\[\(\{<]?\s*(?:Question\s*Type|Question\s*Nature|Type)\s*:\s*([^\]\)\}>\n\r]+?)(?=[\]\)\}>]|\s*(?:Subject|Topic|Micro[-\s]?theme|Sub[-\s]?topic|Nano[-\s]?theme|Difficulty)\s*:|$)",
-    re.UNICODE,
-)
+
+
+def _bracketed_tag_value(header: str, key: str) -> str | None:
+    """Value of a properly bracketed "[Key: value]" tag, running to its matching "]".
+
+    The value may contain parentheses ("[Nano Theme: Cave Temples (Ajanta, Ellora)]"), which the
+    bracket-tolerant patterns above would cut off at the first ")".
+    """
+    m = re.search(rf"(?i)\[\s*{key}\s*:\s*", header)
+    if not m:
+        return None
+    depth = 1
+    for i in range(m.end(), len(header)):
+        ch = header[i]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                value = re.sub(r"\s+", " ", header[m.end():i]).strip()
+                return value or None
+    return None
+
+
+def _header_tag(header: str, key: str, pattern: re.Pattern) -> str | None:
+    value = _bracketed_tag_value(header, key)
+    if value:
+        return value
+    m = pattern.search(header)
+    return m.group(1).strip() if m else None
 
 # Option lines: (A) text, (B) text, etc.
 # Tolerant of (A), [A], A), A. at line start
@@ -164,39 +211,18 @@ STATEMENT_LINE_PATTERN = re.compile(
 
 
 def extract_header_tags(header_line: str) -> dict:
-    """Extracts Subject, Topic, Subtopic, Difficulty, and Type from a Q_HEADER line."""
-    subject = None
-    topic = None
-    subtopic = None
-    difficulty = None
-    type_raw = None
-
-    sm = SUBJECT_TAG_PATTERN.search(header_line)
-    if sm:
-        subject = sm.group(1).strip()
-
-    tm = TOPIC_TAG_PATTERN.search(header_line)
-    if tm:
-        topic = tm.group(1).strip()
-
-    stm = SUBTOPIC_TAG_PATTERN.search(header_line)
-    if stm:
-        subtopic = stm.group(1).strip()
-
-    dm = DIFFICULTY_TAG_PATTERN.search(header_line)
-    if dm:
-        difficulty = dm.group(1).strip()
-
-    tym = TYPE_TAG_PATTERN.search(header_line)
-    if tym:
-        type_raw = tym.group(1).strip()
-
+    """Extracts Subject, Topic, Subtopic, Difficulty, Type, Core Concept, Nature and Approach from a
+    Q_HEADER line (several physical lines joined with spaces). Missing tags come back as None."""
+    header = re.sub(r"\s+", " ", header_line or "")
     return {
-        "subject_raw": subject,
-        "topic_raw": topic,
-        "subtopic_raw": subtopic,
-        "difficulty_raw": difficulty,
-        "type_raw": type_raw,
+        "subject_raw": _header_tag(header, _SUBJECT_KEY, SUBJECT_TAG_PATTERN),
+        "topic_raw": _header_tag(header, _TOPIC_KEY, TOPIC_TAG_PATTERN),
+        "subtopic_raw": _header_tag(header, _SUBTOPIC_KEY, SUBTOPIC_TAG_PATTERN),
+        "difficulty_raw": _header_tag(header, _DIFFICULTY_KEY, DIFFICULTY_TAG_PATTERN),
+        "type_raw": _header_tag(header, _TYPE_KEY, TYPE_TAG_PATTERN),
+        "core_concept_raw": _header_tag(header, _CORE_CONCEPT_KEY, CORE_CONCEPT_TAG_PATTERN),
+        "nature_raw": _header_tag(header, _NATURE_KEY, NATURE_TAG_PATTERN),
+        "approach_raw": _header_tag(header, _APPROACH_KEY, APPROACH_TAG_PATTERN),
     }
 
 

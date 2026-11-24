@@ -17,7 +17,7 @@ responsible, how to run and operate it, why it is built the way it is, and what 
 >   Live searches follow `SIMILARITY_LIVE_USE_RERANKER` (default `false`).
 > - **Vectors and similar lists are separate runs.** `backfill_question_embeddings` builds vectors only;
 >   `build_similar_lists [--reranker]` builds the lists. Admin → Similar Questions → Search index has two
->   steps with a ranking choice. A PDF upload starts a vectors run only.
+>   steps with a ranking choice. A PDF upload starts no run (since 2026-11-24); an admin starts both.
 > - The algorithm version includes the ranking, and students are served lists built with either ranking.
 > - Students see **15** similar questions (admin setting).
 > Where §3.4, §3.6 and §6 below say "Jina reranker", read "optional Jina reranker".
@@ -371,8 +371,7 @@ subject-wise tests and the admin bank filter — so a "History" session contains
 | `app/db/models/question_embedding.py` | `QuestionEmbedding`, `Bm25TermStats`, `Bm25FieldStats` models |
 | `app/scripts/backfill_question_embeddings.py` | CLI for a search-index run: embeddings (Gemini batch, 100 texts per request), BM25 statistics, similar lists; `--dry-run` prints the plan and estimate |
 | `app/scripts/audit_similar_questions.py` | Backend-only audit of `/similar` over every question (see §9) |
-| `app/tasks/vector_tasks.py` | After a PDF upload: a search-index run (Celery if a worker is running, else asyncio); embeddings only if another run is active |
-| `app/tasks/exam_tasks.py` | Starts vectorization (and Knowledge Layer enrichment) after a PDF is extracted |
+| `app/tasks/exam_tasks.py` | PDF extraction; since 2026-11-24 it no longer starts vectorization or Knowledge Layer enrichment (`vector_tasks.py` and `enrichment_tasks.py` removed) |
 | `app/repositories/question_repository.py` → `list_questions_filtered` | Exact main-subject filter for question lists / sessions |
 | `app/knowledge/similarity.py` | Knowledge Layer fallback |
 | `app/config/settings.py` | All `SIMILARITY_*`, `GEMINI_*`, `JINA_*` settings |
@@ -456,8 +455,10 @@ Details, including what to check after migration 076: [§10.3](#103-data-steps-a
 
 ### Day to day
 
-- **New paper uploaded:** after extraction, `dispatch_exam_vectorization` starts a search-index run
-  (trigger "upload"): that exam's embeddings, BM25 statistics, and the lists of every out-of-date subject.
+- **New paper uploaded:** nothing starts automatically (since 2026-11-24, see
+  `docs/INGESTION_PIPELINE_CHANGES.md`, change 2). Upload, review and publish; then start a **vectors**
+  run and a **similar lists** run from Admin → Similar Questions (or the two scripts). They find every new,
+  changed or newly published question themselves.
 - **Questions published or edited:** Admin → Similar Questions → Search index shows the subjects out of
   date and the estimated cost; press **Start run** (or run the backfill script). Only changed texts are
   re-embedded and only changed subjects are recomputed.
@@ -574,10 +575,10 @@ Found while building and running it; none is a crash, each is a behaviour to kno
 
 | # | Issue | Effect | Where / what to do |
 |---|---|---|---|
-| 1 | **Publishing or editing questions does not start a run.** Only a PDF upload does. | New or edited questions are missing from (or out of date in) their neighbours' stored lists until someone presses Start run. Students still see valid suggestions (every stored item is re-checked: published, same subject), just not the newest ones. | Admin page shows "subjects out of date". Possible fix: start a run (or mark the subject dirty and let a scheduled run pick it up) after publish/edit in the review flow. |
+| 1 | **Nothing starts a run automatically** (publishing, editing or, since 2026-11-24, uploading). | New or edited questions are missing from (or out of date in) their neighbours' stored lists until someone presses Start run. Students still see valid suggestions (every stored item is re-checked: published, same subject), just not the newest ones. | Admin page shows "subjects out of date". Possible fix: start a run (or mark the subject dirty and let a scheduled run pick it up) after publish/edit in the review flow. |
 | 2 | **Admin-started runs run inside the API process** (an asyncio task). | Restarting the API (deploy, `uvicorn --reload` after a code change) kills a run. Its row stays "running" until its heartbeat is 15 min old, and blocks new runs until then; after that it is marked `interrupted` and a new run resumes. | `routers/search_index.py`. For production, run it on a Celery worker or from the CLI (`backfill_question_embeddings`). With several API workers, each has its own task set; the database lock still allows only one run. |
 | 3 | **Live page views and runs share one Jina key** (2 requests at a time, 100k tokens/min). | During a run, a live search (question without a stored list) can get HTTP 429 from Jina; the live reranker then keeps the fused order silently, so ranking is slightly worse for those requests. Runs keep 1 request and 80% of the tokens. | `rate_limiter.py`, settings `JINA_RUN_MAX_CONCURRENT_REQUESTS`, `JINA_RERANK_TOKENS_PER_MINUTE`. A second Jina key for runs would remove this. |
-| 4 | **Upload-triggered runs can be long.** A PDF upload starts a run that also rebuilds every out-of-date subject, at the key's pace. | While it runs, the admin "Start run" button returns 409; an upload during a run only embeds its paper (`_embed_exam_only`) and leaves the rest for the next run. | `tasks/vector_tasks.py`. Expected behaviour; documented here so it is not mistaken for a hang. |
+| 4 | ~~**Upload-triggered runs can be long.**~~ | No longer applies: since 2026-11-24 a PDF upload starts no run. | `tasks/vector_tasks.py` removed. |
 | 5 | **The token estimate is approximate** (characters ÷ 4 plus per-document overhead). | The admin page's "~22M Jina tokens" for a full build may differ from Jina's bill; Gemini/Jina balances cannot be read by the app at all. | `search_index.build_plan`. The limiter corrects its pacing with the real usage Jina reports, but the estimate shown before a run is not corrected. |
 | 6 | **The admin status call recomputes the plan each time** (reads every question's text hashes); the page polls it every 3 s while a run is active. | 0.43 s per call on 2,190 questions; grows with the question bank. | `services/searchIndexService.ts` / `SearchIndexPanel.tsx`: while a run is active, poll `GET /admin/search-index/runs/{id}` instead and reload the full status when it ends. |
 | 7 | **Run lock is checked in code, not by a database constraint.** | Two runs started in the same instant are resolved after insert (the newer one deletes itself and returns 409). A tiny window remains between processes on different machines. | `SearchIndexRunner.create_run`. A partial unique index on `search_index_runs(status)` for active statuses would make it airtight. |
@@ -718,7 +719,6 @@ Conflict risk = how likely another developer's changes collide with ours in that
 | `app/services/vector/search_index.py`, `stored_similarities.py`, `provider_errors.py`, `rate_limiter.py` | precomputed lists and runs (§3.6) |
 | `app/routers/search_index.py` | admin API `/api/v1/admin/search-index/*` |
 | `app/scripts/backfill_question_embeddings.py`, `app/scripts/audit_similar_questions.py` | CLI |
-| `app/tasks/vector_tasks.py` | runs after a PDF upload |
 | `tests/test_similarity_helpers.py`, `tests/test_subject_filter.py`, `tests/test_search_index.py` | tests |
 
 **Backend: modified files**
@@ -764,6 +764,7 @@ Conflict risk = how likely another developer's changes collide with ours in that
 - After 076, old-pipeline questions have a single hierarchy link, so their subject/topic chips show
   their own subtopic (previously sometimes an AI-guessed other subject).
 - A PDF upload now starts a search-index run (embeddings + affected lists) in the background.
+  *(Reverted 2026-11-24: uploads start no run; see `docs/INGESTION_PIPELINE_CHANGES.md`, change 2.)*
 
 ### 10.7 Merge checklist
 

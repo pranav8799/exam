@@ -733,3 +733,89 @@ def test_limiter_learns_the_key_limit_from_jinas_message():
     assert lim.budget == 80_000          # 80% of the key's limit, the rest for page views
     lim.rate_limited(msg)
     assert lim.budget == 80_000          # stays there; it does not keep shrinking
+
+
+# ── tracking across publish / new papers / edits (the runs are the only trigger) ──
+
+from app.scripts import backfill_question_embeddings as _backfill  # noqa: E402
+
+_REAL_FETCH_CANDIDATES = _backfill.fetch_question_candidates  # saved before the autouse fixture patches it
+
+
+@pytest.mark.anyio
+async def test_question_published_later_and_a_new_paper_are_both_picked_up(factory):
+    """Q4 is a draft during the first run; later it is published and new questions arrive. The next run
+    lists Q4 and the new questions, and rebuilds the lists in their subject (they may now include them)."""
+    ids = await seed(factory)
+    first = await runner(factory).run("cli", options={"kind": "similar_lists"})
+    assert first.summary["lists_computed"] == 10
+    assert all(r.question_id != ids["p_draft"] for r in await rows(factory, QuestionSimilarityList))
+
+    async with factory() as s:
+        draft = await s.get(Question, ids["p_draft"])
+        draft.status = QuestionStatus.PUBLISHED
+        s.add(draft)
+        new_ids = []
+        for n in (11, 12):
+            q = await _add(s, Question(exam_id=ids["e19"], question_number_in_paper=n,
+                                       status=QuestionStatus.PUBLISHED, subject_raw="Polity"))
+            new_ids.append(q.id)
+        await s.commit()
+
+    plan = await build_plan(factory, kind="similar_lists")
+    assert [x["subject"] for x in plan["pending"]["out_of_date_subjects"]] == ["Polity"]
+
+    FakeService.calls = []
+    second = await runner(factory).run("cli", options={"kind": "similar_lists"})
+    assert second.status == "succeeded", second.error_message
+    # Polity now has 6 published questions, each list recomputed in both modes; History untouched
+    assert second.summary["lists_computed"] == 6 * 2
+    assert {qid for qid, _ in FakeService.calls}.isdisjoint({ids["h1"], ids["h2"]})
+    lists = {(r.question_id, r.mode): r for r in await rows(factory, QuestionSimilarityList)}
+    assert (ids["p_draft"], "default") in lists and all((q, "default") in lists for q in new_ids)
+    p1_items = [i["id"] for i in lists[(ids["p1"], "default")].items]
+    assert ids["p_draft"] in p1_items and set(new_ids) <= set(p1_items)
+    assert (await build_plan(factory, kind="similar_lists"))["up_to_date"] is True
+
+
+@pytest.mark.anyio
+async def test_edited_question_is_reembedded_and_only_its_subject_rebuilt(factory, monkeypatch):
+    """Editing a question's text marks it for re-embedding; once its vector is rebuilt, its subject's
+    lists are out of date and only that subject is recomputed."""
+    from sqlalchemy import text as sql
+    from app.services.vector.gemini_embedder import compute_sha256
+
+    ids = await seed(factory)
+    async with factory() as s:
+        for qid in [v for k, v in ids.items() if not k.startswith("e")]:
+            await s.exec(sql(
+                "INSERT INTO question_embeddings (question_id, question_dense_embedding, question_hash, "
+                "embedding_model, created_at, updated_at) VALUES (:q, '[0.1]', :h, 'm', :t, :t)"
+            ).bindparams(q=qid, h=compute_sha256(f"Question text number {qid}"), t=datetime.now(timezone.utc)))
+        await s.commit()
+
+    async def fetch(**kw):
+        return await _REAL_FETCH_CANDIDATES(session_factory=factory, **{k: v for k, v in kw.items() if k != "session_factory"})
+
+    assert all(c["is_uptodate"] for c in await fetch())
+    await runner(factory).run("cli", options={"kind": "similar_lists"})
+
+    async with factory() as s:
+        tr = (await s.exec(select(QuestionTranslation).where(QuestionTranslation.question_id == ids["p1"]))).first()
+        tr.question_text = "Edited question text"
+        s.add(tr)
+        await s.commit()
+    pending = [c for c in await fetch() if not c["is_uptodate"]]
+    assert [(c["question_id"], c["embed_question"], c["embed_explanation"]) for c in pending] == [(ids["p1"], True, False)]
+
+    # What the vectors run stores for it: the new vector and the new text hash
+    async with factory() as s:
+        await s.exec(sql("UPDATE question_embeddings SET question_hash = :h WHERE question_id = :q")
+                     .bindparams(h=compute_sha256("Edited question text"), q=ids["p1"]))
+        await s.commit()
+    assert all(c["is_uptodate"] for c in await fetch())
+
+    FakeService.calls = []
+    run = await runner(factory).run("cli", options={"kind": "similar_lists"})
+    assert run.summary["lists_computed"] == 3 * 2  # Polity only
+    assert {qid for qid, _ in FakeService.calls} == {ids["p1"], ids["p2"], ids["p3"]}

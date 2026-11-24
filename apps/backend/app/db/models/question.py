@@ -87,6 +87,11 @@ class Question(SQLModel, table=True):
     topic_raw: Optional[str] = Field(default=None, max_length=255)
     subtopic_raw: Optional[str] = Field(default=None, max_length=255)
     difficulty_raw: Optional[str] = Field(default=None, max_length=50)
+    # Header tags added to papers in Nov 2026 ([Core Concept: ...] [Nature: ...] [Approach: ...]);
+    # NULL for questions from older papers
+    core_concept_raw: Optional[str] = Field(default=None, max_length=255)
+    nature_raw: Optional[str] = Field(default=None, max_length=100)
+    approach_raw: Optional[str] = Field(default=None, max_length=100)
     extraction_confidence: Optional[float] = Field(default=None)
     extraction_issues_json: Optional[list] = Field(
         default=[],

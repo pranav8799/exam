@@ -485,3 +485,97 @@ def test_diamond_bulleted_reverse_logic_box_is_split_out_of_the_solution():
     assert set(record.reverse_logic) == {"A", "B"}
     assert record.reverse_logic["A"]["why_tempting"] == "Ashoka is the best-known Mauryan emperor."
     assert record.reverse_logic["A"]["whats_actually_true"] == "Megasthenes came a generation earlier, to Chandragupta."
+
+
+# Header layout used by papers from Nov 2026 (UPSC CSE Prelims 1979 PDF): three extra tags, a Nano Theme
+# value with parentheses, and the header wrapped over several lines (one line holds only [Approach]).
+NEW_TAGS_QUESTION = """
+Q1. [Subject: Art & Culture] [Microtheme: Architecture – Cave and Rockcut] [Nano
+Theme: Cave Temples & Art Sites (Ajanta, Ellora, Mahabalipuram)]
+[Core Concept: Ajanta Caves] [Difficulty: Moderate] [Nature: Static – Basic]
+[Approach: Factual]
+Ajanta Caves are located in the State of
+(A) Maharashtra
+(B) Gujarat
+(C) Tamil Nadu
+(D) West Bengal
+Answer: (A) Maharashtra
+Solution:
+Concept / Background
+• The Ajanta Caves are rock-cut Buddhist cave monuments in Maharashtra.
+Question Analysis
+• Option (B) Gujarat is wrong: Gujarat has Buddhist caves at Junagadh, but not Ajanta.
+Exam Tip: Ajanta and Ellora both belong to Maharashtra.
+Q2. [Subject: Art & Culture] [Microtheme: Art Forms – Dance] [Nano Theme:
+Classical Dance — Forms & Features] [Core Concept: Classical Dance]
+[Difficulty: Moderate] [Nature: Current – Govt/Report] [Approach: Elimination]
+Which of the following is a dance-drama?
+(A) Kathakali
+(B) Bharatnatyam
+(C) Odissi
+(D) Manipuri
+Answer: (A) Kathakali
+Solution:
+Concept / Background
+• Kathakali of Kerala is the standard example of a dance-drama.
+"""
+
+
+def test_core_concept_nature_and_approach_tags_are_extracted():
+    blocks = split_into_question_blocks(NEW_TAGS_QUESTION)
+    assert [b["question_number"] for b in blocks] == [1, 2]
+    first, second = (parse_question_block(b) for b in blocks)
+
+    assert first.subject_raw == "Art & Culture"
+    assert first.topic_raw == "Architecture – Cave and Rockcut"
+    # Parentheses inside a bracketed value are kept (they used to cut the value at the first ")")
+    assert first.subtopic_raw == "Cave Temples & Art Sites (Ajanta, Ellora, Mahabalipuram)"
+    assert first.core_concept_raw == "Ajanta Caves"
+    assert first.difficulty_raw == "Moderate"
+    assert first.nature_raw == "Static – Basic"
+    assert first.approach_raw == "Factual"
+    assert first.type_raw is None
+
+    # A header line holding only [Approach: ...] is header, not stem
+    assert first.stem == "Ajanta Caves are located in the State of"
+    assert first.answer_label == "A"
+    assert first.extraction_issues == []
+
+    assert second.subtopic_raw == "Classical Dance — Forms & Features"
+    assert second.core_concept_raw == "Classical Dance"
+    assert second.nature_raw == "Current – Govt/Report"
+    assert second.approach_raw == "Elimination"
+    assert second.stem == "Which of the following is a dance-drama?"
+
+
+def test_papers_without_the_new_tags_are_unchanged():
+    rec = parse_question_block(split_into_question_blocks(SAMPLE_USER_TEXT)[0])
+    assert rec.subject_raw == "History & Culture"
+    assert rec.topic_raw == "Ancient Indian Literature & Art"
+    assert rec.subtopic_raw == "Sanskrit Dramatists & Classical Poets"
+    assert rec.difficulty_raw == "Tough"
+    assert rec.core_concept_raw is None
+    assert rec.nature_raw is None
+    assert rec.approach_raw is None
+
+
+def test_question_nature_stays_an_alias_of_type():
+    text = (
+        "Q1. [Subject: Polity] [Question Nature: Statement-based] [Difficulty: Easy]\n"
+        "Which statement is correct?\n(A) one\n(B) two\n(C) three\n(D) four\n"
+        "Answer: (A) one\nSolution: Because.\n"
+    )
+    rec = parse_question_block(split_into_question_blocks(text)[0])
+    assert rec.type_raw == "Statement-based"
+    assert rec.nature_raw is None
+    assert rec.stem == "Which statement is correct?"
+
+
+def test_unbracketed_tags_stop_at_the_next_tag_name():
+    from app.pipeline.patterns import extract_header_tags
+
+    tags = extract_header_tags("Subject: Geography Core Concept: Monsoon Nature: Static Approach: Conceptual")
+    assert tags["subject_raw"] == "Geography"
+    assert tags["core_concept_raw"] == "Monsoon"
+    assert tags["nature_raw"] == "Static"
+    assert tags["approach_raw"] == "Conceptual"

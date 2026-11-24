@@ -42,6 +42,10 @@ export interface QuestionReviewData extends AdminQuestionPublicationData {
   negative_marks?: number;
   expected_time_seconds?: number;
   hierarchy?: QuestionReviewHierarchyLink[];
+  // Header tags from newer papers (read-only); absent for questions from older papers
+  core_concept_raw?: string | null;
+  nature_raw?: string | null;
+  approach_raw?: string | null;
   explanation?: {
     detailed_solution?: string | null;
     reverse_logic?: string | null;
@@ -383,6 +387,17 @@ export function QuestionReviewCard({ question, isEditing, saving, onStartEdit, o
             )}
             {'  ·  '}
             {question.marks} marks
+            {(question.core_concept_raw || question.nature_raw || question.approach_raw) && (
+              <span style={{ display: 'block', marginTop: 4 }}>
+                {[
+                  question.core_concept_raw && `Core concept: ${question.core_concept_raw}`,
+                  question.nature_raw && `Nature: ${question.nature_raw}`,
+                  question.approach_raw && `Approach: ${question.approach_raw}`,
+                ]
+                  .filter(Boolean)
+                  .join('  ·  ')}
+              </span>
+            )}
           </span>
           <button
             type="button"

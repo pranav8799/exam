@@ -4,6 +4,7 @@
 **Purpose:** a record of how question-paper ingestion works *today*, written before any changes, so later
 changes can be compared against it. It describes the code as it is, including rough edges; §11 lists
 observations without proposing fixes.
+**Changes made since this baseline** are logged in [INGESTION_PIPELINE_CHANGES.md](INGESTION_PIPELINE_CHANGES.md).
 
 ---
 

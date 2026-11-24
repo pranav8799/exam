@@ -1494,8 +1494,8 @@ export function UploadReviewView({ onNavigate, initialTab = 'PIPELINE_ONLY' }: U
                 }}
               >
                 No exam or year needed. Each question&apos;s exam and year are read from its tag, e.g.{' '}
-                <strong>[MPSC Mains 2017]</strong>. Subject, Microtheme, Nano Theme and difficulty are tagged by AI
-                after upload. The bank is named after the file.
+                <strong>[MPSC Mains 2017]</strong>. Subject, Microtheme, Nano Theme and difficulty come only from the
+                PDF&apos;s own tags; they are not filled in automatically. The bank is named after the file.
               </div>
             )}
 
