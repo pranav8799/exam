@@ -18,6 +18,9 @@ The feature itself is documented in [SIMILAR_QUESTIONS.md](SIMILAR_QUESTIONS.md)
 | D4 | **Building vectors and building similar lists are separate runs** (separate admin buttons and separate script commands). | Vectors (Gemini) are built once; similar lists can then be rebuilt as often as needed, with or without Jina, without paying for embeddings again. |
 | D5 | **Students see 15 similar questions** (Admin → Similar Questions). | Product choice. |
 | D6 | Log every change in this file. | Traceability. |
+| D7 | (2026-11-25) **The practice panel's exam toggles start with only the current question's exam on**; the student switches other exams on. Not a bug. | Product choice: a UPSC student sees UPSC first. |
+| D8 | (2026-11-25) The panel title stays **"Cross Exam Similar Questions"**. | Product choice. |
+| D9 | (2026-11-25) **A question without a subject shows a blank subject**, never a made-up "General Studies". | Keep the UI simple: show the subject if it exists, otherwise nothing. |
 
 ---
 
@@ -111,6 +114,36 @@ estimated; with the reranker, 10). New: `test_rrf_display_score_scale`, `test_al
 `test_switching_ranking_rebuilds_but_keeps_serving_the_old_lists`,
 `test_reranked_lists_run_without_jina_key_stops_before_touching_lists`, `test_admin_api_kinds_and_reranker_needs_a_key`.
 
+### 4.4 Frontend fixes (2026-11-25, branch `feature/ingestion-pipeline`)
+
+| File | Change | Branch open item |
+|---|---|---|
+| `components/admin/AdminTopNav.tsx` | `breadcrumbMap` gains `'similar-questions': 'Similar Questions'`; the top bar read "Overview" on that page. | 8.1 #3 |
+| `components/admin/QuestionReviewCard.tsx` | Taxonomy line = the parts that exist (subject, topic, subtopic) joined by " › "; no "General Studies". | 8.1 #6 (D9) |
+| `components/admin/AdminQuestionPublicationCard.tsx` | `[Subject: ]` left blank when the question has no subject. | 8.1 #6 |
+| `components/student/PsychometricReportView.tsx` | Subject groups of the post-exam report use the real subject or a blank name (three places). | 8.1 #6 |
+| `pages/ExamEnginePage.tsx` | Question section label and section grouping: blank instead of "General Studies". | 8.1 #6 |
+| `components/admin/views/SearchIndexPanel.tsx` | While a run is active, polls only that run (`GET /runs/{id}`) every 3 s instead of the full status (which recomputes the whole plan); reloads the full status when the run ends, and every 20th poll (~1 min) because only the status call closes a dead run. | 8.4 #6 |
+
+Not changed on purpose: session titles (guest score summary / dashboard attempt cards in `GuestExamPage.tsx`,
+the exam header topic in `ExamEnginePage.tsx`) still fall back to "General Studies", since they name a session,
+not a question's subject. The publication card's "General Concepts" / "Core Theme" placeholders for a missing
+Microtheme / Nano Theme are also unchanged.
+
+**Impact analysis (GitNexus, before editing):** `SearchIndexPanel`, `AdminTopNav`, `QuestionReviewCard`,
+`AdminQuestionPublicationCard`, `PsychometricReportView`: LOW. `ExamEnginePage`: UNKNOWN (no resolved callers);
+a text search confirmed its only user is the lazy route in `App.tsx`. `detect-changes` before the commit
+reported **critical** (14 symbols, 22 flows), because the changed components sit in large pages (question bank,
+review, post-exam report, exam engine); the edits themselves are fallback strings, one map entry and the polling
+effect.
+
+**Verification:** `npx tsc --noEmit -p apps/frontend` passes. In the browser (local backend + frontend, admin
+account): the breadcrumb reads "Admin › Similar Questions"; with no run active the page makes one status call
+and does not poll; a "Rebuild anyway" lists run without the reranker (run #3, nothing to rebuild, under 1 s,
+0 lists changed) produced POST `/runs` → `/status` → `/runs/3` → `/status`, then no more requests, and no
+console or server errors. Repeated polls during a long run were not observed (no free run with real work was
+available: the vectors run for the 158 new 1979 questions calls Gemini).
+
 ---
 
 ## 5. Database (`Exam_planner_19112026`, local PostgreSQL 18)
@@ -193,8 +226,8 @@ the searches that found it and "RRF ranked" / "Jina reranked"), or call
 | # | Item | Notes |
 |---|---|---|
 | 1 | ~~Build vectors, then build similar lists.~~ | Done 2026-11-22 (§6.1). |
-| 2 | **Exam toggles on the practice panels hide cross-exam suggestions** (branch open item 8.1 #1). **Confirmed on real data** (§6.1: 15 returned, 0 shown). | The toggles start with only the question's own exam on and filter the server's results in the browser, so students can see fewer than 15, or none. Suggested fix: start with all exams on. `pages/StudentPracticeExamPage.tsx`, `pages/GuestExamPage.tsx`. |
-| 3 | Other branch open items (SIMILAR_QUESTIONS.md §8) | Unchanged: breadcrumb label, double request on session load, "General Studies" labels, subject-name differences across exams. |
+| 2 | ~~Exam toggles on the practice panels hide cross-exam suggestions~~ (branch open item 8.1 #1). | **Intended (D7), 2026-11-25.** Remaining side effect: the server picks the top 15 across all exams and the browser hides switched-off exams, so the default view can show fewer than 15, or none (§6.1: 15 returned, 0 shown). Filling it would need the chosen exams sent to `/similar`; not decided. |
+| 3 | Other branch open items (SIMILAR_QUESTIONS.md §8) | Breadcrumb label and "General Studies" labels fixed (§4.4); admin polling fixed (§4.4). Still open: double request on session load, subject-name differences across exams. |
 | 4 | ~~Nothing is committed.~~ | Committed and merged into `main` (§8). |
 | 5 | ~~Admin page not checked in a browser.~~ | Checked 2026-11-22 with an admin account (§6.1). |
 
@@ -209,6 +242,7 @@ the searches that found it and "RRF ranked" / "Jina reranked"), or call
 | 2026-11-22 | **Push to GitHub (`origin`, `pranav8799/exam`) refused with HTTP 403**: Git on this machine (Windows Git Credential Manager) is signed in as a different GitHub account that has no write access to the repository. Both branches are to be pushed once the right account is signed in or given access. |
 | 2026-11-24 | Fixed by naming the account in this project's remote: `origin` = `https://pranav8799@github.com/pranav8799/exam.git`. Git Credential Manager then asked once for a `pranav8799` sign-in (done in the browser by the owner) and keeps it next to the other account's login, which other projects still use. |
 | 2026-11-24 | `feature/similar-questions` and `main` pushed to GitHub (`pranav8799/exam`), together with this log update. |
+| 2026-11-25 | Frontend fixes (§4.4) and these doc updates committed on `feature/ingestion-pipeline` and pushed. Not merged into `main`. |
 
 **Included besides the feature files:** `.gitnexusignore` (keeps the branch copy and `.db_backups/` out of the GitNexus
 index), `CLAUDE.md` (GitNexus refreshed its index counts), `uv.lock` (adds `pgvector`), this log and

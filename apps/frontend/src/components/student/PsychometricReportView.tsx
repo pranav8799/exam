@@ -532,7 +532,7 @@ export function PsychometricReportView({
       const subjMap: Record<string, any> = {};
 
       questionsList.forEach((q, idx) => {
-        const sName = q.subject || q.subject_name || 'General Studies';
+        const sName = q.subject || q.subject_name || '';
         const tName = q.topic || q.topic_name || 'Core Concepts';
         const subName = q.subtopic || 'Foundations';
         const state = getQuestionState(q);
@@ -743,7 +743,7 @@ export function PsychometricReportView({
     const subjMap: Record<string, any> = {};
 
     subjs.forEach((s: any) => {
-      const sName = s.taxonomy_name || s.subject_name || s.name || s.subject || 'General Studies';
+      const sName = s.taxonomy_name || s.subject_name || s.name || s.subject || '';
       const tot = Number(s.total_questions || s.total || s.total_attempts || 0);
       const att = Number(s.attempted_questions || s.attempted || s.total_attempts || 0);
       const corr = Number(s.correct || s.correct_attempts || 0);
@@ -809,7 +809,7 @@ export function PsychometricReportView({
     });
 
     tops.forEach((t: any) => {
-      const sName = t.subject || 'General Studies';
+      const sName = t.subject || '';
       const tName = t.taxonomy_name || t.topic || 'Core Concept';
       if (!subjMap[sName]) {
         subjMap[sName] = {

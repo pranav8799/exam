@@ -554,7 +554,7 @@ export function ExamEnginePage({ isGuest = false }: { isGuest?: boolean }) {
               is_correct: Boolean(o.is_correct),
               translations: o.translations || {},
             })),
-            section_code: q.topic_name || q.subject_name || gTopic || 'General Studies',
+            section_code: q.topic_name || q.subject_name || gTopic || '',
             difficulty: q.difficulty || 'MEDIUM',
             marks: q.marks || 2.0,
             negative_marks: q.negative_marks || 0.66,
@@ -1308,7 +1308,7 @@ export function ExamEnginePage({ isGuest = false }: { isGuest?: boolean }) {
     const subjMap: Record<string, { total: number; startQNum: number; endQNum: number }> = {};
     validQuestions.forEach((q, idx) => {
       const qNum = (q as any).question_number || idx + 1;
-      const subj = (q as any).subject || (q as any).section_code || 'General Studies';
+      const subj = (q as any).subject || (q as any).section_code || '';
       if (!subjMap[subj]) {
         subjMap[subj] = { total: 0, startQNum: qNum, endQNum: qNum };
       }

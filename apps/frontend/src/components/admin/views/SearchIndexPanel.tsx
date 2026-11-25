@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Database, ListOrdered, Loader2, Play, RefreshCw, XCircle } from 'lucide-react';
 import {
+  fetchSearchIndexRun,
   fetchSearchIndexStatus,
   startSearchIndexRun,
   type IndexPlan,
@@ -20,6 +21,10 @@ import {
  */
 
 const POLL_MS = 3000;
+/** During a run, every Nth poll reloads the full status (~once a minute) instead of the run alone. */
+const FULL_STATUS_EVERY = 20;
+
+const isActive = (s: RunStatus) => s === 'queued' || s === 'running';
 
 const PHASES: { key: NonNullable<IndexRun['phase']>; label: string }[] = [
   { key: 'embeddings', label: 'Embeddings' },
@@ -382,7 +387,6 @@ export function SearchIndexPanel() {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState<RunKind | null>(null);
   const [useReranker, setUseReranker] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -396,19 +400,48 @@ export function SearchIndexPanel() {
     }
   }, [useReranker]);
 
-  // Load (again when the ranking choice changes) and poll while a run is active
+  // Load the full status (again when the ranking choice changes)
   useEffect(() => {
+    load();
+  }, [load]);
+
+  // While a run is active, poll only that run: the full status recomputes the whole plan (slow on a big
+  // question bank). Reload the full status when the run ends, and now and then during it, because only
+  // the status call closes a run whose server or script died (no heartbeat for 15 min).
+  const activeRunId = status?.active_run?.id ?? null;
+  useEffect(() => {
+    if (activeRunId == null) return;
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let ticks = 0;
     const tick = async () => {
-      const data = await load();
-      if (!cancelled && data?.active_run) timer.current = setTimeout(tick, POLL_MS);
+      ticks += 1;
+      let keepPolling = true;
+      if (ticks % FULL_STATUS_EVERY === 0) {
+        const data = await load();
+        keepPolling = !data || data.active_run?.id === activeRunId;
+      } else {
+        try {
+          const run = await fetchSearchIndexRun(activeRunId);
+          if (cancelled) return;
+          if (isActive(run.status)) {
+            setStatus((prev) => (prev && prev.active_run?.id === run.id ? { ...prev, active_run: run } : prev));
+          } else {
+            const data = await load(); // finished: refresh the plans, the last run's report and the history
+            keepPolling = !data;
+          }
+        } catch {
+          // a failed poll is retried on the next tick
+        }
+      }
+      if (!cancelled && keepPolling) timer = setTimeout(tick, POLL_MS);
     };
-    tick();
+    timer = setTimeout(tick, POLL_MS);
     return () => {
       cancelled = true;
-      if (timer.current) clearTimeout(timer.current);
+      if (timer) clearTimeout(timer);
     };
-  }, [load, status?.active_run?.id]);
+  }, [activeRunId, load]);
 
   const vectors = status?.vectors_plan;
   const lists = status?.lists_plan;

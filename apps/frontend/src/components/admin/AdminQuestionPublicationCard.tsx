@@ -186,7 +186,7 @@ export function AdminQuestionPublicationCard({
 
   // Taxonomy resolution
   const primHier = question.hierarchy?.find((h) => h.is_primary) || question.hierarchy?.[0];
-  const subject = question.subject_name || primHier?.subject_name || 'General Studies';
+  const subject = question.subject_name || primHier?.subject_name || '';
   const microtheme = question.topic_name || primHier?.topic_name || 'General Concepts';
   const nanoTheme =
     question.subtopic_name ||

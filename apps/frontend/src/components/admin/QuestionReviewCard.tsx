@@ -372,9 +372,7 @@ export function QuestionReviewCard({ question, isEditing, saving, onStartEdit, o
           }}
         >
           <span>
-            {question.subject_name || 'General Studies'}
-            {question.topic_name ? ` › ${question.topic_name}` : ''}
-            {question.subtopic_name ? ` › ${question.subtopic_name}` : ''}
+            {[question.subject_name, question.topic_name, question.subtopic_name].filter(Boolean).join(' › ')}
             {'  ·  '}
             <strong>{question.difficulty}</strong>
             {(question.question_type_tag || question.cognitive_skill || (question as any).metadata?.cognitive_skill) && (
